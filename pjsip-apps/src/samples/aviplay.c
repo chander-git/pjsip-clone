@@ -25,8 +25,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "util.h"
-
 /**
  * \page page_pjmedia_samples_aviplay_c Samples: Playing AVI File to
  * Video and Sound Devices
@@ -56,6 +54,7 @@
 
 #if defined(PJMEDIA_HAS_VIDEO) && (PJMEDIA_HAS_VIDEO != 0)
 
+#include "util.h"
 
 /* For logging purpose. */
 #define THIS_FILE   "aviplay.c"
@@ -467,13 +466,13 @@ static int main_func(int argc, char *argv[])
     if (argc != 2) {
     	puts("Error: filename required");
 	puts(desc);
-	return 1;
+	return 110;
     }
 
 
     /* Must init PJLIB first: */
     status = pj_init();
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
+    PJ_ASSERT_RETURN(status == PJ_SUCCESS, 120);
 
     /* Must create a pool factory before we can allocate any memory. */
     pj_caching_pool_init(&cp, &pj_pool_factory_default_policy, 0);
@@ -492,24 +491,32 @@ static int main_func(int argc, char *argv[])
     pjmedia_vid_codec_mgr_create(pool, NULL);
     
     status = pjmedia_vid_dev_subsys_init(&cp.factory);
-    if (status != PJ_SUCCESS)
+    if (status != PJ_SUCCESS) {
+        app_perror(THIS_FILE, "Video init failed", status);
+	rc = 130;
         goto on_return;
+    }
     
     status = pjmedia_aud_subsys_init(&cp.factory);
     if (status != PJ_SUCCESS) {
+	rc = 140;
         goto on_return;
     }
     
 #if defined(PJMEDIA_HAS_OPENH264_CODEC) && PJMEDIA_HAS_OPENH264_CODEC != 0
     status = pjmedia_codec_openh264_vid_init(NULL, &cp.factory);
-    if (status != PJ_SUCCESS)
+    if (status != PJ_SUCCESS) {
+	rc = 150;
 	goto on_return;
+    }
 #endif
 
 #if PJMEDIA_HAS_FFMPEG_VID_CODEC
     status = pjmedia_codec_ffmpeg_vid_init(NULL, &cp.factory);
-    if (status != PJ_SUCCESS)
+    if (status != PJ_SUCCESS) {
+	rc = 160;
 	goto on_return;    
+    }
 #endif
 
     rc = aviplay(pool, argv[1]);
@@ -548,7 +555,7 @@ on_return:
     pj_shutdown();
 
     /* Done. */
-    return 0;
+    return rc;
 }
 
 int main(int argc, char *argv[])

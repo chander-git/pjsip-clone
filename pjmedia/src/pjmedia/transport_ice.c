@@ -46,17 +46,26 @@ struct sdp_state
     pj_ice_sess_role	local_role;	/* Our role			    */
 };
 
+/* ICE listener */
+typedef struct ice_listener
+{
+    PJ_DECL_LIST_MEMBER(struct ice_listener);
+    pjmedia_ice_cb	 cb;
+    void		*user_data;
+} ice_listener;
+
 struct transport_ice
 {
     pjmedia_transport	 base;
     pj_pool_t		*pool;
-    int			 af;
     unsigned		 options;	/**< Transport options.		    */
 
     unsigned		 comp_cnt;
     pj_ice_strans	*ice_st;
 
     pjmedia_ice_cb	 cb;
+    ice_listener	 listener;
+    ice_listener	 listener_empty;
     unsigned		 media_option;
 
     pj_bool_t		 initial_sdp;
@@ -70,9 +79,11 @@ struct transport_ice
 
     pj_bool_t		 use_ice;
     pj_sockaddr		 rtp_src_addr;	/**< Actual source RTP address.	    */
+    unsigned		 rtp_src_cnt;   /**< How many pkt from this addr.   */
     pj_sockaddr		 rtcp_src_addr;	/**< Actual source RTCP address.    */
-    unsigned		 rtp_src_cnt;	/**< How many pkt from this addr.   */
     unsigned		 rtcp_src_cnt;  /**< How many pkt from this addr.   */
+    pj_bool_t		 enable_rtcp_mux;/**< Enable RTP& RTCP multiplexing?*/
+    pj_bool_t		 use_rtcp_mux;	/**< Use RTP & RTCP multiplexing?   */
 
     unsigned		 tx_drop_pct;	/**< Percent of tx pkts to drop.    */
     unsigned		 rx_drop_pct;	/**< Percent of rx pkts to drop.    */
@@ -80,6 +91,7 @@ struct transport_ice
     void	       (*rtp_cb)(void*,
 			         void*,
 				 pj_ssize_t);
+    void	       (*rtp_cb2)(pjmedia_tp_cb_param*);
     void	       (*rtcp_cb)(void*,
 				  void*,
 				  pj_ssize_t);
@@ -102,6 +114,9 @@ static pj_status_t transport_attach   (pjmedia_transport *tp,
 				       void (*rtcp_cb)(void*,
 						       void*,
 						       pj_ssize_t));
+static pj_status_t transport_attach2  (pjmedia_transport *tp,
+				       pjmedia_transport_attach_param
+				           *att_param);
 static void	   transport_detach   (pjmedia_transport *tp,
 				       void *strm);
 static pj_status_t transport_send_rtp( pjmedia_transport *tp,
@@ -148,6 +163,11 @@ static void ice_on_ice_complete(pj_ice_strans *ice_st,
 				pj_ice_strans_op op,
 			        pj_status_t status);
 
+/*
+ * Clean up ICE resources.
+ */
+static void tp_ice_on_destroy(void *arg);
+
 
 static pjmedia_transport_op transport_ice_op = 
 {
@@ -162,10 +182,10 @@ static pjmedia_transport_op transport_ice_op =
     &transport_media_start,
     &transport_media_stop,
     &transport_simulate_lost,
-    &transport_destroy
+    &transport_destroy,
+    &transport_attach2
 };
 
-static const pj_str_t STR_RTP_AVP	= { "RTP/AVP", 7 };
 static const pj_str_t STR_CANDIDATE	= { "candidate", 9};
 static const pj_str_t STR_REM_CAND	= { "remote-candidates", 17 };
 static const pj_str_t STR_ICE_LITE	= { "ice-lite", 8};
@@ -175,6 +195,7 @@ static const pj_str_t STR_ICE_PWD	= { "ice-pwd", 7 };
 static const pj_str_t STR_IP4		= { "IP4", 3 };
 static const pj_str_t STR_IP6		= { "IP6", 3 };
 static const pj_str_t STR_RTCP		= { "rtcp", 4 };
+static const pj_str_t STR_RTCP_MUX	= { "rtcp-mux", 8 };
 static const pj_str_t STR_BANDW_RR	= { "RR", 2 };
 static const pj_str_t STR_BANDW_RS	= { "RS", 2 };
 
@@ -235,7 +256,6 @@ PJ_DEF(pj_status_t) pjmedia_ice_create3(pjmedia_endpt *endpt,
     pool = pjmedia_endpt_create_pool(endpt, name, 512, 512);
     tp_ice = PJ_POOL_ZALLOC_T(pool, struct transport_ice);
     tp_ice->pool = pool;
-    tp_ice->af = cfg->af;
     tp_ice->options = options;
     tp_ice->comp_cnt = comp_cnt;
     pj_ansi_strcpy(tp_ice->base.name, pool->obj_name);
@@ -245,6 +265,8 @@ PJ_DEF(pj_status_t) pjmedia_ice_create3(pjmedia_endpt *endpt,
     tp_ice->initial_sdp = PJ_TRUE;
     tp_ice->oa_role = ROLE_NONE;
     tp_ice->use_ice = PJ_FALSE;
+    pj_list_init(&tp_ice->listener);
+    pj_list_init(&tp_ice->listener_empty);
 
     pj_memcpy(&ice_st_cfg, cfg, sizeof(pj_ice_strans_cfg));
     if (cb)
@@ -269,6 +291,8 @@ PJ_DEF(pj_status_t) pjmedia_ice_create3(pjmedia_endpt *endpt,
 	ice_st_cfg.comp[COMP_RTP-1].so_sndbuf_size = 
 			    PJMEDIA_TRANSPORT_SO_SNDBUF_SIZE;
     }
+    if (ice_st_cfg.send_buf_size == 0)
+    	ice_st_cfg.send_buf_size = PJMEDIA_MAX_MTU;
 
     /* Create ICE */
     status = pj_ice_strans_create(name, &ice_st_cfg, comp_cnt, tp_ice, 
@@ -277,6 +301,13 @@ PJ_DEF(pj_status_t) pjmedia_ice_create3(pjmedia_endpt *endpt,
 	pj_pool_release(pool);
 	*p_tp = NULL;
 	return status;
+    }
+
+    /* Sync to ICE */
+    {
+	pj_grp_lock_t *grp_lock = pj_ice_strans_get_grp_lock(tp_ice->ice_st);
+	pj_grp_lock_add_ref(grp_lock);
+	pj_grp_lock_add_handler(grp_lock, pool, tp_ice, &tp_ice_on_destroy);
     }
 
     /* Done */
@@ -289,15 +320,84 @@ PJ_DEF(pj_grp_lock_t *) pjmedia_ice_get_grp_lock(pjmedia_transport *tp)
     return pj_ice_strans_get_grp_lock(((struct transport_ice *)tp)->ice_st);
 }
 
+
+/*
+ * Add application to receive ICE notifications from the specified ICE media
+ * transport.
+ */
+PJ_DEF(pj_status_t) pjmedia_ice_add_ice_cb( pjmedia_transport *tp,
+					    const pjmedia_ice_cb *cb,
+					    void *user_data)
+{
+    struct transport_ice *tp_ice = (struct transport_ice*)tp;
+    ice_listener *il;
+    pj_grp_lock_t *grp_lock;
+
+    PJ_ASSERT_RETURN(tp && cb, PJ_EINVAL);
+    grp_lock = pjmedia_ice_get_grp_lock(tp);
+    PJ_ASSERT_RETURN(grp_lock, PJ_EINVAL);
+
+    pj_grp_lock_acquire(grp_lock);
+
+    if (!pj_list_empty(&tp_ice->listener_empty)) {
+	il = tp_ice->listener_empty.next;
+	pj_list_erase(il);
+	il->cb = *cb;
+	il->user_data = user_data;
+	pj_list_push_back(&tp_ice->listener, il);
+    } else {
+	il = PJ_POOL_ZALLOC_T(tp_ice->pool, ice_listener);
+	pj_list_init(il);
+	il->cb = *cb;
+	il->user_data = user_data;
+	pj_list_push_back(&tp_ice->listener, il);
+    }
+
+    pj_grp_lock_release(grp_lock);
+
+    return PJ_SUCCESS;
+}
+
+
+/*
+ * Remove application to stop receiving ICE notifications the specified
+ * ICE media transport.
+ */
+PJ_DEF(pj_status_t) pjmedia_ice_remove_ice_cb( pjmedia_transport *tp,
+					       const pjmedia_ice_cb *cb,
+					       void *user_data)
+{
+    struct transport_ice *tp_ice = (struct transport_ice*)tp;
+    ice_listener *il;
+    pj_grp_lock_t *grp_lock;
+
+    PJ_ASSERT_RETURN(tp && cb, PJ_EINVAL);
+    grp_lock = pjmedia_ice_get_grp_lock(tp);
+    PJ_ASSERT_RETURN(grp_lock, PJ_EINVAL);
+
+    pj_grp_lock_acquire(grp_lock);
+
+    for (il=tp_ice->listener.next; il!=&tp_ice->listener; il=il->next) {
+	if (pj_memcmp(&il->cb, cb, sizeof(cb))==0 && il->user_data==user_data)
+	    break;
+    }
+    if (il != &tp_ice->listener) {
+	pj_list_erase(il);
+	pj_list_push_back(&tp_ice->listener_empty, il);
+    }
+
+    pj_grp_lock_release(grp_lock);
+
+    return (il != &tp_ice->listener? PJ_SUCCESS : PJ_ENOTFOUND);
+}
+
 /* Disable ICE when SDP from remote doesn't contain a=candidate line */
 static void set_no_ice(struct transport_ice *tp_ice, const char *reason,
 		       pj_status_t err)
 {
     if (err != PJ_SUCCESS) {
-	char errmsg[PJ_ERR_MSG_SIZE];
-	pj_strerror(err, errmsg, sizeof(errmsg));
-	PJ_LOG(4,(tp_ice->base.name, 
-		  "Stopping ICE, reason=%s:%s", reason, errmsg));
+	PJ_PERROR(4,(tp_ice->base.name, err,
+		     "Stopping ICE, reason=%s", reason));
     } else {
 	PJ_LOG(4,(tp_ice->base.name, 
 		  "Stopping ICE, reason=%s", reason));
@@ -407,7 +507,8 @@ static pj_status_t encode_session_in_sdp(struct transport_ice *tp_ice,
 					 pjmedia_sdp_session *sdp_local,
 					 unsigned media_index,
 					 unsigned comp_cnt,
-					 pj_bool_t restart_session)
+					 pj_bool_t restart_session,
+					 pj_bool_t rtcp_mux)
 {
     enum { 
 	ATTR_BUF_LEN = 160,	/* Max len of a=candidate attr */
@@ -600,6 +701,7 @@ static pj_status_t encode_session_in_sdp(struct transport_ice *tp_ice,
 	    attr = pjmedia_sdp_attr_create(sdp_pool, STR_ICE_UFRAG.ptr, &str);
 	    pjmedia_sdp_attr_add(&m->attr_count, m->attr, attr);
 
+	    str.slen = PJ_ICE_PWD_LEN;
 	    str.ptr = (char*) pj_pool_alloc(sdp_pool, str.slen);
 	    pj_create_random_string(str.ptr, str.slen);
 	    attr = pjmedia_sdp_attr_create(sdp_pool, STR_ICE_PWD.ptr, &str);
@@ -661,7 +763,15 @@ static pj_status_t encode_session_in_sdp(struct transport_ice *tp_ice,
             m->bandw_count++;
         }
     }
-    
+
+    /* Add a=rtcp-mux attribute */
+    if (rtcp_mux) {
+	pjmedia_sdp_attr *add_attr;
+
+	add_attr = PJ_POOL_ZALLOC_T(sdp_pool, pjmedia_sdp_attr);
+    	add_attr->name = STR_RTCP_MUX;
+    	m->attr[m->attr_count++] = add_attr;
+    }
 
     return PJ_SUCCESS;
 }
@@ -673,111 +783,110 @@ static pj_status_t parse_cand(const char *obj_name,
 			      const pj_str_t *orig_input,
 			      pj_ice_sess_cand *cand)
 {
-    pj_str_t input;
-    char *token, *host;
+    pj_str_t token, delim, host;
     int af;
-    pj_str_t s;
+    pj_ssize_t found_idx;
     pj_status_t status = PJNATH_EICEINCANDSDP;
 
     pj_bzero(cand, sizeof(*cand));
-    pj_strdup_with_null(pool, &input, orig_input);
 
     PJ_UNUSED_ARG(obj_name);
 
     /* Foundation */
-    token = strtok(input.ptr, " ");
-    if (!token) {
+    delim = pj_str(" ");
+    found_idx = pj_strtok(orig_input, &delim, &token, 0);
+    if (found_idx == orig_input->slen) {
 	TRACE__((obj_name, "Expecting ICE foundation in candidate"));
 	goto on_return;
     }
-    pj_strdup2(pool, &cand->foundation, token);
+    pj_strdup(pool, &cand->foundation, &token);
 
     /* Component ID */
-    token = strtok(NULL, " ");
-    if (!token) {
+    found_idx = pj_strtok(orig_input, &delim, &token, found_idx + token.slen);
+    if (found_idx == orig_input->slen) {
 	TRACE__((obj_name, "Expecting ICE component ID in candidate"));
 	goto on_return;
     }
-    cand->comp_id = (pj_uint8_t) atoi(token);
+    cand->comp_id = (pj_uint8_t)pj_strtoul(&token);
 
     /* Transport */
-    token = strtok(NULL, " ");
-    if (!token) {
+    found_idx = pj_strtok(orig_input, &delim, &token, found_idx + token.slen);
+    if (found_idx == orig_input->slen) {
 	TRACE__((obj_name, "Expecting ICE transport in candidate"));
 	goto on_return;
     }
-    if (pj_ansi_stricmp(token, "UDP") != 0) {
+    if (pj_stricmp2(&token, "UDP") != 0) {
 	TRACE__((obj_name, 
 		 "Expecting ICE UDP transport only in candidate"));
 	goto on_return;
     }
 
     /* Priority */
-    token = strtok(NULL, " ");
-    if (!token) {
+    found_idx = pj_strtok(orig_input, &delim, &token, found_idx + token.slen);
+    if (found_idx == orig_input->slen) {
 	TRACE__((obj_name, "Expecting ICE priority in candidate"));
 	goto on_return;
     }
-    cand->prio = atoi(token);
+    cand->prio = pj_strtoul(&token);
 
     /* Host */
-    host = strtok(NULL, " ");
-    if (!host) {
+    found_idx = pj_strtok(orig_input, &delim, &host, found_idx + token.slen);
+    if (found_idx == orig_input->slen) {
 	TRACE__((obj_name, "Expecting ICE host in candidate"));
 	goto on_return;
     }
     /* Detect address family */
-    if (pj_ansi_strchr(host, ':'))
+    if (pj_strchr(&host, ':'))
 	af = pj_AF_INET6();
     else
 	af = pj_AF_INET();
     /* Assign address */
-    if (pj_sockaddr_init(af, &cand->addr, pj_cstr(&s, host), 0)) {
+    if (pj_sockaddr_init(af, &cand->addr, &host, 0)) {
 	TRACE__((obj_name, "Invalid ICE candidate address"));
 	goto on_return;
     }
 
     /* Port */
-    token = strtok(NULL, " ");
-    if (!token) {
+    found_idx = pj_strtok(orig_input, &delim, &token, found_idx + host.slen);
+    if (found_idx == orig_input->slen) {
 	TRACE__((obj_name, "Expecting ICE port number in candidate"));
 	goto on_return;
     }
-    pj_sockaddr_set_port(&cand->addr, (pj_uint16_t)atoi(token));
+    pj_sockaddr_set_port(&cand->addr, (pj_uint16_t)pj_strtoul(&token));
 
     /* typ */
-    token = strtok(NULL, " ");
-    if (!token) {
+    found_idx = pj_strtok(orig_input, &delim, &token, found_idx + token.slen);
+    if (found_idx == orig_input->slen) {
 	TRACE__((obj_name, "Expecting ICE \"typ\" in candidate"));
 	goto on_return;
     }
-    if (pj_ansi_stricmp(token, "typ") != 0) {
+    if (pj_stricmp2(&token, "typ") != 0) {
 	TRACE__((obj_name, "Expecting ICE \"typ\" in candidate"));
 	goto on_return;
     }
 
     /* candidate type */
-    token = strtok(NULL, " ");
-    if (!token) {
+    found_idx = pj_strtok(orig_input, &delim, &token, found_idx + token.slen);
+    if (found_idx == orig_input->slen) {
 	TRACE__((obj_name, "Expecting ICE candidate type in candidate"));
 	goto on_return;
     }
 
-    if (pj_ansi_stricmp(token, "host") == 0) {
+    if (pj_stricmp2(&token, "host") == 0) {
 	cand->type = PJ_ICE_CAND_TYPE_HOST;
 
-    } else if (pj_ansi_stricmp(token, "srflx") == 0) {
+    } else if (pj_stricmp2(&token, "srflx") == 0) {
 	cand->type = PJ_ICE_CAND_TYPE_SRFLX;
 
-    } else if (pj_ansi_stricmp(token, "relay") == 0) {
+    } else if (pj_stricmp2(&token, "relay") == 0) {
 	cand->type = PJ_ICE_CAND_TYPE_RELAYED;
 
-    } else if (pj_ansi_stricmp(token, "prflx") == 0) {
+    } else if (pj_stricmp2(&token, "prflx") == 0) {
 	cand->type = PJ_ICE_CAND_TYPE_PRFLX;
 
     } else {
-	PJ_LOG(5,(obj_name, "Invalid ICE candidate type %s in candidate", 
-		  token));
+	PJ_LOG(5,(obj_name, "Invalid ICE candidate type %.*s in candidate", 
+		  token.slen, token.ptr));
 	goto on_return;
     }
 
@@ -798,7 +907,8 @@ static pj_status_t create_initial_offer(struct transport_ice *tp_ice,
 
     /* Encode ICE in SDP */
     status = encode_session_in_sdp(tp_ice, sdp_pool, loc_sdp, media_index, 
-				   tp_ice->comp_cnt, PJ_FALSE);
+				   tp_ice->comp_cnt, PJ_FALSE,
+				   tp_ice->enable_rtcp_mux);
     if (status != PJ_SUCCESS) {
 	set_no_ice(tp_ice, "Error encoding SDP answer", status);
 	return status;
@@ -822,9 +932,19 @@ static pj_status_t verify_ice_sdp(struct transport_ice *tp_ice,
     pj_bool_t comp1_found=PJ_FALSE, comp2_found=PJ_FALSE, has_rtcp=PJ_FALSE;
     pj_sockaddr rem_conn_addr, rtcp_addr;
     unsigned i;
+    int rem_af = 0;
     pj_status_t status;
 
     rem_m = rem_sdp->media[media_index];
+
+    /* Check if remote wants RTCP mux */
+    if (tp_ice->enable_rtcp_mux) {
+        pjmedia_sdp_attr *attr;
+
+	attr = pjmedia_sdp_attr_find(rem_m->attr_count, rem_m->attr, 
+				     &STR_RTCP_MUX, NULL);
+	tp_ice->use_rtcp_mux = (attr? PJ_TRUE: PJ_FALSE);
+    }
 
     /* Get the "ice-ufrag" and "ice-pwd" attributes */
     get_ice_attr(rem_sdp, rem_m, &ufrag_attr, &pwd_attr);
@@ -848,6 +968,7 @@ static pj_status_t verify_ice_sdp(struct transport_ice *tp_ice,
 	return PJMEDIA_SDP_EMISSINGCONN;
 
     /* Verify address family matches */
+    /*
     if ((tp_ice->af==pj_AF_INET() && 
 	 pj_strcmp(&rem_conn->addr_type, &STR_IP4)!=0) ||
 	(tp_ice->af==pj_AF_INET6() && 
@@ -855,9 +976,18 @@ static pj_status_t verify_ice_sdp(struct transport_ice *tp_ice,
     {
 	return PJMEDIA_SDP_ETPORTNOTEQUAL;
     }
+    */
+
+    /* Get remote address family */
+    if (pj_strcmp(&rem_conn->addr_type, &STR_IP4)==0)
+	rem_af = pj_AF_INET();
+    else if (pj_strcmp(&rem_conn->addr_type, &STR_IP6)==0)
+	rem_af = pj_AF_INET6();
+    else
+	pj_assert(!"Unsupported address family");
 
     /* Assign remote connection address */
-    status = pj_sockaddr_init(tp_ice->af, &rem_conn_addr, &rem_conn->addr,
+    status = pj_sockaddr_init(rem_af, &rem_conn_addr, &rem_conn->addr,
 			      (pj_uint16_t)rem_m->desc.port);
     if (status != PJ_SUCCESS)
 	return status;
@@ -883,6 +1013,7 @@ static pj_status_t verify_ice_sdp(struct transport_ice *tp_ice,
     	
 	    if (rtcp_attr.addr.slen) {
 		/* Verify address family matches */
+		/*
 		if ((tp_ice->af==pj_AF_INET() && 
 		     pj_strcmp(&rtcp_attr.addr_type, &STR_IP4)!=0) ||
 		    (tp_ice->af==pj_AF_INET6() && 
@@ -890,9 +1021,10 @@ static pj_status_t verify_ice_sdp(struct transport_ice *tp_ice,
 		{
 		    return PJMEDIA_SDP_ETPORTNOTEQUAL;
 		}
+		*/
 
 		/* Assign RTCP address */
-		status = pj_sockaddr_init(tp_ice->af, &rtcp_addr,
+		status = pj_sockaddr_init(rem_af, &rtcp_addr,
 					  &rtcp_attr.addr,
 					  (pj_uint16_t)rtcp_attr.port);
 		if (status != PJ_SUCCESS) {
@@ -900,7 +1032,7 @@ static pj_status_t verify_ice_sdp(struct transport_ice *tp_ice,
 		}
 	    } else {
 		/* Assign RTCP address */
-		status = pj_sockaddr_init(tp_ice->af, &rtcp_addr, 
+		status = pj_sockaddr_init(rem_af, &rtcp_addr, 
 					  NULL, 
 					  (pj_uint16_t)rtcp_attr.port);
 		if (status != PJ_SUCCESS) {
@@ -928,11 +1060,11 @@ static pj_status_t verify_ice_sdp(struct transport_ice *tp_ice,
 	status = parse_cand(tp_ice->base.name, tmp_pool, 
 			    &rem_m->attr[i]->value, &cand);
 	if (status != PJ_SUCCESS) {
-	    PJ_LOG(4,(tp_ice->base.name, 
-		      "Error in parsing SDP candidate attribute '%.*s', "
-		      "candidate is ignored",
-		      (int)rem_m->attr[i]->value.slen, 
-		      rem_m->attr[i]->value.ptr));
+	    PJ_PERROR(4,(tp_ice->base.name, status,
+			 "Error in parsing SDP candidate attribute '%.*s', "
+			 "candidate is ignored",
+			 (int)rem_m->attr[i]->value.slen, 
+			 rem_m->attr[i]->value.ptr));
 	    continue;
 	}
 
@@ -954,7 +1086,9 @@ static pj_status_t verify_ice_sdp(struct transport_ice *tp_ice,
     }
 
     /* Check matched component count and ice_mismatch */
-    if (comp1_found && (tp_ice->comp_cnt==1 || !has_rtcp)) {
+    if (comp1_found &&
+        (tp_ice->comp_cnt==1 || !has_rtcp || tp_ice->use_rtcp_mux))
+    {
 	sdp_state->match_comp_cnt = 1;
 	sdp_state->ice_mismatch = PJ_FALSE;
     } else if (comp1_found && comp2_found) {
@@ -987,13 +1121,13 @@ static pj_status_t verify_ice_sdp(struct transport_ice *tp_ice,
     }
 
     /* Detect our role */
-    if (current_ice_role==PJ_ICE_SESS_ROLE_CONTROLLING) {
+    if (pjmedia_sdp_attr_find(rem_sdp->attr_count, rem_sdp->attr,
+			      &STR_ICE_LITE, NULL) != NULL)
+    {
+	/* Remote is ICE lite, set our role as controlling */
 	sdp_state->local_role = PJ_ICE_SESS_ROLE_CONTROLLING;
     } else {
-	if (pjmedia_sdp_attr_find(rem_sdp->attr_count, rem_sdp->attr,
-				  &STR_ICE_LITE, NULL) != NULL)
-	{
-	    /* Remote is ICE Lite */
+	if (current_ice_role==PJ_ICE_SESS_ROLE_CONTROLLING) {
 	    sdp_state->local_role = PJ_ICE_SESS_ROLE_CONTROLLING;
 	} else {
 	    sdp_state->local_role = PJ_ICE_SESS_ROLE_CONTROLLED;
@@ -1011,6 +1145,60 @@ static pj_status_t verify_ice_sdp(struct transport_ice *tp_ice,
 
     return PJ_SUCCESS;
 
+}
+
+/* Encode information in SDP if ICE is not used */
+static pj_status_t encode_no_ice_in_sdp( struct transport_ice *tp_ice,
+					 pj_pool_t *pool,
+					 pjmedia_sdp_session *sdp_local,
+					 const pjmedia_sdp_session *rem_sdp,
+					 unsigned media_index)
+{
+    if (tp_ice->enable_rtcp_mux) {
+        pjmedia_sdp_media *m = sdp_local->media[media_index];
+        pjmedia_sdp_attr *attr;
+        pj_bool_t add_rtcp_mux = PJ_TRUE;
+
+	if (rem_sdp)
+	    add_rtcp_mux = tp_ice->use_rtcp_mux;
+	else {
+	    /* For subsequent offer, set it to false first since
+	     * we are still waiting for remote answer.
+	     */
+	    tp_ice->use_rtcp_mux = PJ_FALSE;
+	}
+
+        /* Remove RTCP attribute because for subsequent offers/answers,
+         * the address (obtained from transport_get_info() ) may be
+         * incorrect if we are not yet confirmed to use RTCP mux
+         * (because we are still waiting for remote answer) or
+         * if remote rejects it.
+         */
+        pjmedia_sdp_attr_remove_all(&m->attr_count, m->attr, "rtcp");
+	
+	if (!tp_ice->use_rtcp_mux && tp_ice->comp_cnt > 1) {
+	    pj_ice_sess_cand cand;
+	    pj_status_t status;
+	    
+	    status = pj_ice_strans_get_def_cand(tp_ice->ice_st, 2, &cand);
+	    if (status == PJ_SUCCESS) {
+	   	/* Add RTCP attribute if the remote doesn't offer or
+	    	 * rejects it.
+	    	 */
+	    	attr = pjmedia_sdp_attr_create_rtcp(pool, &cand.addr);	
+	    	if (attr)
+	            pjmedia_sdp_attr_add(&m->attr_count, m->attr, attr);
+	    }
+	}
+
+	/* Add a=rtcp-mux attribute. */
+	if (add_rtcp_mux) {
+	    attr = PJ_POOL_ZALLOC_T(pool, pjmedia_sdp_attr);
+    	    attr->name = STR_RTCP_MUX;
+    	    m->attr[m->attr_count++] = attr;
+	}
+    }
+    return PJ_SUCCESS;
 }
 
 
@@ -1041,6 +1229,8 @@ static pj_status_t create_initial_answer(struct transport_ice *tp_ice,
     /* Does remote support ICE? */
     if (tp_ice->rem_offer_state.match_comp_cnt==0) {
 	set_no_ice(tp_ice, "No ICE found in SDP offer", PJ_SUCCESS);
+	encode_no_ice_in_sdp(tp_ice, sdp_pool, loc_sdp, rem_sdp,
+			     media_index);
 	return PJ_SUCCESS;
     }
 
@@ -1054,7 +1244,7 @@ static pj_status_t create_initial_answer(struct transport_ice *tp_ice,
     /* Encode ICE in SDP */
     status = encode_session_in_sdp(tp_ice, sdp_pool, loc_sdp, media_index, 
 				   tp_ice->rem_offer_state.match_comp_cnt,
-				   PJ_FALSE);
+				   PJ_FALSE, tp_ice->use_rtcp_mux);
     if (status != PJ_SUCCESS) {
 	set_no_ice(tp_ice, "Error encoding SDP answer", status);
 	return status;
@@ -1074,12 +1264,13 @@ static pj_status_t create_subsequent_offer(struct transport_ice *tp_ice,
 
     if (pj_ice_strans_has_sess(tp_ice->ice_st) == PJ_FALSE) {
 	/* We don't have ICE */
+	encode_no_ice_in_sdp(tp_ice, sdp_pool, loc_sdp, NULL, media_index);
 	return PJ_SUCCESS;
     }
 
     comp_cnt = pj_ice_strans_get_running_comp_cnt(tp_ice->ice_st);
     return encode_session_in_sdp(tp_ice, sdp_pool, loc_sdp, media_index,
-				 comp_cnt, PJ_FALSE);
+				 comp_cnt, PJ_FALSE, tp_ice->enable_rtcp_mux);
 }
 
 
@@ -1108,6 +1299,8 @@ static pj_status_t create_subsequent_answer(struct transport_ice *tp_ice,
 
 	if (tp_ice->rem_offer_state.match_comp_cnt == 0) {
 	    /* Remote no longer offers ICE */
+	    encode_no_ice_in_sdp(tp_ice, sdp_pool, loc_sdp, rem_sdp,
+			     	 media_index);
 	    return PJ_SUCCESS;
 	}
 
@@ -1118,7 +1311,8 @@ static pj_status_t create_subsequent_answer(struct transport_ice *tp_ice,
 
 	status = encode_session_in_sdp(tp_ice, sdp_pool, loc_sdp, media_index,
 				       tp_ice->rem_offer_state.match_comp_cnt,
-				       tp_ice->rem_offer_state.ice_restart);
+				       tp_ice->rem_offer_state.ice_restart,
+				       tp_ice->use_rtcp_mux);
 	if (status != PJ_SUCCESS)
 	    return status;
 
@@ -1131,6 +1325,8 @@ static pj_status_t create_subsequent_answer(struct transport_ice *tp_ice,
 
 	if (tp_ice->rem_offer_state.match_comp_cnt == 0) {
 	    /* Remote does not support ICE */
+	    encode_no_ice_in_sdp(tp_ice, sdp_pool, loc_sdp, rem_sdp,
+			     	 media_index);
 	    return PJ_SUCCESS;
 	}
 
@@ -1152,7 +1348,8 @@ static pj_status_t create_subsequent_answer(struct transport_ice *tp_ice,
 
 	status = encode_session_in_sdp(tp_ice, sdp_pool, loc_sdp, media_index,
 				       tp_ice->rem_offer_state.match_comp_cnt,
-				       tp_ice->rem_offer_state.ice_restart);
+				       tp_ice->rem_offer_state.ice_restart,
+				       tp_ice->use_rtcp_mux);
 	if (status != PJ_SUCCESS)
 	    return status;
 
@@ -1181,6 +1378,7 @@ static pj_status_t transport_media_create(pjmedia_transport *tp,
     PJ_UNUSED_ARG(sdp_pool);
 
     tp_ice->media_option = options;
+    tp_ice->enable_rtcp_mux = ((options & PJMEDIA_TPMED_RTCP_MUX) != 0);
     tp_ice->oa_role = ROLE_NONE;
     tp_ice->initial_sdp = PJ_TRUE;
 
@@ -1210,15 +1408,22 @@ static pj_status_t transport_encode_sdp(pjmedia_transport *tp,
      * transport checking is disabled
      */
     if ((tp_ice->media_option & PJMEDIA_TPMED_NO_TRANSPORT_CHECKING) == 0) {
-	pjmedia_sdp_media *loc_m, *rem_m;
+	pjmedia_sdp_media *m_rem, *m_loc;
+	pj_uint32_t tp_proto_loc, tp_proto_rem;
 
-	rem_m = rem_sdp? rem_sdp->media[media_index] : NULL;
-	loc_m = sdp_local->media[media_index];
+	m_rem = rem_sdp? rem_sdp->media[media_index] : NULL;
+	m_loc = sdp_local->media[media_index];
 
-	if (pj_stricmp(&loc_m->desc.transport, &STR_RTP_AVP) ||
-	   (rem_m && pj_stricmp(&rem_m->desc.transport, &STR_RTP_AVP)))
+	tp_proto_loc = pjmedia_sdp_transport_get_proto(&m_loc->desc.transport);
+	tp_proto_rem = m_rem? 
+		pjmedia_sdp_transport_get_proto(&m_rem->desc.transport) : 0;
+	PJMEDIA_TP_PROTO_TRIM_FLAG(tp_proto_loc, PJMEDIA_TP_PROFILE_RTCP_FB);
+	PJMEDIA_TP_PROTO_TRIM_FLAG(tp_proto_rem, PJMEDIA_TP_PROFILE_RTCP_FB);
+
+	if ((tp_proto_loc != PJMEDIA_TP_PROTO_RTP_AVP) ||
+	    (m_rem && tp_proto_rem != PJMEDIA_TP_PROTO_RTP_AVP))
 	{
-	    pjmedia_sdp_media_deactivate(sdp_pool, loc_m);
+	    pjmedia_sdp_media_deactivate(sdp_pool, m_loc);
 	    return PJMEDIA_SDP_EINPROTO;
 	}
     }
@@ -1285,14 +1490,15 @@ static pj_status_t start_ice(struct transport_ice *tp_ice,
 	status = parse_cand(tp_ice->base.name, tmp_pool, &attr->value, 
 			    &cand[cand_cnt]);
 	if (status != PJ_SUCCESS) {
-	    PJ_LOG(4,(tp_ice->base.name, 
-		      "Error in parsing SDP candidate attribute '%.*s', "
-		      "candidate is ignored",
-		      (int)attr->value.slen, attr->value.ptr));
+	    PJ_PERROR(4,(tp_ice->base.name, status,
+			 "Error in parsing SDP candidate attribute '%.*s', "
+			 "candidate is ignored",
+			 (int)attr->value.slen, attr->value.ptr));
 	    continue;
 	}
 
-	cand_cnt++;
+	if (!tp_ice->use_rtcp_mux || cand[cand_cnt].comp_id < 2)
+	    cand_cnt++;
     }
 
     /* Start ICE */
@@ -1464,9 +1670,8 @@ static pj_status_t transport_media_start(pjmedia_transport *tp,
 					    &ufrag_attr->value, 
 					    &pwd_attr->value);
 	    if (status != PJ_SUCCESS) {
-		PJ_LOG(1,(tp_ice->base.name, 
-			  "ICE re-initialization failed (status=%d)!",
-			  status));
+		PJ_PERROR(1,(tp_ice->base.name, status,
+			     "ICE re-initialization failed!"));
 		return status;
 	    }
 	}
@@ -1481,16 +1686,30 @@ static pj_status_t transport_media_start(pjmedia_transport *tp,
 				      PJ_ICE_SESS_ROLE_CONTROLLING);
 	}
 
-
 	/* start ICE */
+    }
+
+    /* RFC 5245 section 8.1.1:
+     * If its peer has a lite implementation, an agent MUST use
+     * a regular nomination algorithm.
+     */
+    if (pjmedia_sdp_attr_find(rem_sdp->attr_count, rem_sdp->attr,
+			      &STR_ICE_LITE, NULL) != NULL)
+    {
+        pj_ice_sess_options opt;
+	pj_ice_strans_get_options(tp_ice->ice_st, &opt);
+	if (opt.aggressive) {
+	    opt.aggressive = PJ_FALSE;
+	    pj_ice_strans_set_options(tp_ice->ice_st, &opt);
+	    PJ_LOG(4,(tp_ice->base.name, "Forcefully set ICE to use regular "
+		      "nomination as remote is lite implementation"));
+	}
     }
 
     /* Now start ICE */
     status = start_ice(tp_ice, tmp_pool, rem_sdp, media_index);
     if (status != PJ_SUCCESS) {
-	PJ_LOG(1,(tp_ice->base.name, 
-		  "ICE restart failed (status=%d)!",
-		  status));
+	PJ_PERROR(1,(tp_ice->base.name, status, "ICE restart failed!"));
 	return status;
     }
 
@@ -1529,7 +1748,9 @@ static pj_status_t transport_get_info(pjmedia_transport *tp,
     pj_sockaddr_cp(&info->sock_info.rtp_addr_name, &cand.addr);
 
     /* Get RTCP default address */
-    if (tp_ice->comp_cnt > 1) {
+    if (tp_ice->use_rtcp_mux) {
+	pj_sockaddr_cp(&info->sock_info.rtcp_addr_name, &cand.addr);
+    } else if (tp_ice->comp_cnt > 1) {
 	status = pj_ice_strans_get_def_cand(tp_ice->ice_st, 2, &cand);
 	if (status != PJ_SUCCESS)
 	    return status;
@@ -1541,9 +1762,13 @@ static pj_status_t transport_get_info(pjmedia_transport *tp,
      * ICE activated or received any packets.
      */
     if (tp_ice->use_ice || tp_ice->rtp_src_cnt) {
-	info->src_rtp_name  = tp_ice->rtp_src_addr;
+	info->src_rtp_name = tp_ice->rtp_src_addr;
+	if (tp_ice->use_rtcp_mux)
+	    info->src_rtcp_name = tp_ice->rtp_src_addr;
     }
-    if (tp_ice->use_ice || tp_ice->rtcp_src_cnt) {
+    if ((!tp_ice->use_rtcp_mux) &&
+    	(tp_ice->use_ice || tp_ice->rtcp_src_cnt))
+    {
 	info->src_rtcp_name = tp_ice->rtcp_src_addr;
     }
 
@@ -1601,21 +1826,43 @@ static pj_status_t transport_attach  (pjmedia_transport *tp,
 						      void*,
 						      pj_ssize_t))
 {
+    pjmedia_transport_attach_param param;
+    
+    pj_bzero(&param, sizeof(param));
+    param.user_data = stream;
+    pj_sockaddr_cp(&param.rem_addr, rem_addr);
+    pj_sockaddr_cp(&param.rem_rtcp, rem_rtcp);
+    param.addr_len = addr_len;
+    param.rtp_cb = rtp_cb;
+    param.rtcp_cb = rtcp_cb;
+    return transport_attach2(tp, &param);
+}
+
+
+static pj_status_t transport_attach2  (pjmedia_transport *tp,
+				       pjmedia_transport_attach_param
+				           *att_param)
+{
     struct transport_ice *tp_ice = (struct transport_ice*)tp;
 
-    tp_ice->stream = stream;
-    tp_ice->rtp_cb = rtp_cb;
-    tp_ice->rtcp_cb = rtcp_cb;
+    tp_ice->stream = att_param->user_data;
+    tp_ice->rtp_cb = att_param->rtp_cb;
+    tp_ice->rtp_cb2 = att_param->rtp_cb2;
+    tp_ice->rtcp_cb = att_param->rtcp_cb;
 
-    pj_memcpy(&tp_ice->remote_rtp, rem_addr, addr_len);
-    pj_memcpy(&tp_ice->remote_rtcp, rem_rtcp, addr_len);
-    tp_ice->addr_len = addr_len;
+    /* Check again if we are multiplexing RTP & RTCP. */
+    tp_ice->use_rtcp_mux = (pj_sockaddr_has_addr(&att_param->rem_addr) &&
+    			    pj_sockaddr_cmp(&att_param->rem_addr,
+					    &att_param->rem_rtcp) == 0);
+
+    pj_memcpy(&tp_ice->remote_rtp, &att_param->rem_addr, att_param->addr_len);
+    pj_memcpy(&tp_ice->remote_rtcp, &att_param->rem_rtcp, att_param->addr_len);
+    tp_ice->addr_len = att_param->addr_len;
 
     /* Init source RTP & RTCP addresses and counter */
     tp_ice->rtp_src_addr = tp_ice->remote_rtp;
-    tp_ice->rtcp_src_addr = tp_ice->remote_rtcp;
-    tp_ice->rtp_src_cnt = 0;
-    tp_ice->rtcp_src_cnt = 0;
+    pj_bzero(&tp_ice->rtcp_src_addr, sizeof(tp_ice->rtcp_src_addr));
+    tp_ice->rtp_src_cnt = tp_ice->rtcp_src_cnt = 0;
 
     return PJ_SUCCESS;
 }
@@ -1629,6 +1876,7 @@ static void transport_detach(pjmedia_transport *tp,
     /* TODO: need to solve ticket #460 here */
 
     tp_ice->rtp_cb = NULL;
+    tp_ice->rtp_cb2 = NULL;
     tp_ice->rtcp_cb = NULL;
     tp_ice->stream = NULL;
 
@@ -1641,6 +1889,7 @@ static pj_status_t transport_send_rtp(pjmedia_transport *tp,
 				      pj_size_t size)
 {
     struct transport_ice *tp_ice = (struct transport_ice*)tp;
+    pj_status_t status;
 
     /* Simulate packet lost on TX direction */
     if (tp_ice->tx_drop_pct) {
@@ -1652,9 +1901,13 @@ static pj_status_t transport_send_rtp(pjmedia_transport *tp,
 	}
     }
 
-    return pj_ice_strans_sendto(tp_ice->ice_st, 1, 
-			        pkt, size, &tp_ice->remote_rtp,
-				tp_ice->addr_len);
+    status = pj_ice_strans_sendto2(tp_ice->ice_st, 1, 
+			           pkt, size, &tp_ice->remote_rtp,
+				   tp_ice->addr_len);
+    if (status == PJ_EPENDING)
+        status = PJ_SUCCESS;
+
+    return status;
 }
 
 
@@ -1672,13 +1925,22 @@ static pj_status_t transport_send_rtcp2(pjmedia_transport *tp,
 				        pj_size_t size)
 {
     struct transport_ice *tp_ice = (struct transport_ice*)tp;
-    if (tp_ice->comp_cnt > 1) {
+
+    if (tp_ice->comp_cnt > 1 || tp_ice->use_rtcp_mux) {
+        pj_status_t status;
+        unsigned comp_id = (tp_ice->use_rtcp_mux? 1: 2);
+
 	if (addr == NULL) {
 	    addr = &tp_ice->remote_rtcp;
 	    addr_len = pj_sockaddr_get_len(addr);
-	}
-	return pj_ice_strans_sendto(tp_ice->ice_st, 2, pkt, size, 
-				    addr, addr_len);
+	}	  
+
+	status = pj_ice_strans_sendto2(tp_ice->ice_st, comp_id, pkt, size,
+				       addr, addr_len);
+	if (status == PJ_EPENDING)
+	    status = PJ_SUCCESS;
+
+	return status;
     } else {
 	return PJ_SUCCESS;
     }
@@ -1694,8 +1956,20 @@ static void ice_on_rx_data(pj_ice_strans *ice_st, unsigned comp_id,
     pj_bool_t discard = PJ_FALSE;
 
     tp_ice = (struct transport_ice*) pj_ice_strans_get_user_data(ice_st);
+    if (!tp_ice) {
+	/* Destroy on progress */
+	return;
+    }
 
-    if (comp_id==1 && tp_ice->rtp_cb) {
+    if (comp_id == 1) {
+        ++tp_ice->rtp_src_cnt;
+    	pj_sockaddr_cp(&tp_ice->rtp_src_addr, src_addr);
+    } else if (comp_id == 2) {
+	pj_sockaddr_cp(&tp_ice->rtcp_src_addr, src_addr);
+    }
+
+    if (comp_id==1 && (tp_ice->rtp_cb || tp_ice->rtp_cb2)) {
+        pj_bool_t rem_switch = PJ_FALSE;
 
 	/* Simulate packet lost on RX direction */
 	if (tp_ice->rx_drop_pct) {
@@ -1707,79 +1981,68 @@ static void ice_on_rx_data(pj_ice_strans *ice_st, unsigned comp_id,
 	    }
 	}
 
-	/* See if source address of RTP packet is different than the 
-	 * configured address, and switch RTP remote address to 
-	 * source packet address after several consecutive packets
-	 * have been received.
-	 */
-	if (!tp_ice->use_ice) {
-	    pj_bool_t enable_switch =
-		    ((tp_ice->options & PJMEDIA_ICE_NO_SRC_ADDR_CHECKING)==0);
+	if (!discard) {
+	    if (tp_ice->rtp_cb2) {
+		pjmedia_tp_cb_param param;
 
-	    if (!enable_switch ||
-		pj_sockaddr_cmp(&tp_ice->remote_rtp, src_addr) == 0)
-	    {
-		/* Don't switch while we're receiving from remote_rtp */
-		tp_ice->rtp_src_cnt = 0;
+	    	param.user_data = tp_ice->stream;
+	    	param.pkt = pkt;
+	    	param.size = size;
+	    	param.src_addr = (tp_ice->use_ice? NULL:
+	    			  (pj_sockaddr_t *)src_addr);
+	    	param.rem_switch = PJ_FALSE;
+	    	(*tp_ice->rtp_cb2)(&param);
+	    	rem_switch = param.rem_switch;
 	    } else {
-
-		++tp_ice->rtp_src_cnt;
-
-		/* Check if the source address is recognized. */
-		if (pj_sockaddr_cmp(src_addr, &tp_ice->rtp_src_addr) != 0) {
-		    /* Remember the new source address. */
-		    pj_sockaddr_cp(&tp_ice->rtp_src_addr, src_addr);
-		    /* Reset counter */
-		    tp_ice->rtp_src_cnt = 0;
-		    discard = PJ_TRUE;
-		}
-
-		if (tp_ice->rtp_src_cnt < PJMEDIA_RTP_NAT_PROBATION_CNT) {
-		    discard = PJ_TRUE;
-		} else {
-		    char addr_text[80];
-
-		    /* Set remote RTP address to source address */
-		    pj_sockaddr_cp(&tp_ice->remote_rtp, &tp_ice->rtp_src_addr);
-		    tp_ice->addr_len = pj_sockaddr_get_len(&tp_ice->remote_rtp);
-
-		    /* Reset counter */
-		    tp_ice->rtp_src_cnt = 0;
-
-		    PJ_LOG(4,(tp_ice->base.name,
-			      "Remote RTP address switched to %s",
-			      pj_sockaddr_print(&tp_ice->remote_rtp, addr_text,
-						sizeof(addr_text), 3)));
-
-		    /* Also update remote RTCP address if actual RTCP source
-		     * address is not heard yet.
-		     */
-		    if (!pj_sockaddr_has_addr(&tp_ice->rtcp_src_addr)) {
-			pj_uint16_t port;
-
-			pj_sockaddr_cp(&tp_ice->remote_rtcp, 
-				       &tp_ice->remote_rtp);
-
-			port = (pj_uint16_t)
-			       (pj_sockaddr_get_port(&tp_ice->remote_rtp)+1);
-			pj_sockaddr_set_port(&tp_ice->remote_rtcp, port);
-
-			PJ_LOG(4,(tp_ice->base.name,
-				  "Remote RTCP address switched to predicted "
-				  "address %s",
-				  pj_sockaddr_print(&tp_ice->remote_rtcp, 
-						    addr_text,
-						    sizeof(addr_text), 3)));
-		    }
-		}
+	    	(*tp_ice->rtp_cb)(tp_ice->stream, pkt, size);
 	    }
 	}
+	
+#if defined(PJMEDIA_TRANSPORT_SWITCH_REMOTE_ADDR) && \
+    (PJMEDIA_TRANSPORT_SWITCH_REMOTE_ADDR == 1)
+	if (rem_switch &&
+	    (tp_ice->options & PJMEDIA_ICE_NO_SRC_ADDR_CHECKING)==0)
+	{
+	    char addr_text[PJ_INET6_ADDRSTRLEN+10];
 
-	if (!discard)
-	    (*tp_ice->rtp_cb)(tp_ice->stream, pkt, size);
+	    /* Set remote RTP address to source address */
+	    pj_sockaddr_cp(&tp_ice->rtp_src_addr, src_addr);
+	    pj_sockaddr_cp(&tp_ice->remote_rtp, src_addr);
+	    tp_ice->addr_len = pj_sockaddr_get_len(&tp_ice->remote_rtp);
+
+	    PJ_LOG(4,(tp_ice->base.name,
+		      "Remote RTP address switched to %s",
+		      pj_sockaddr_print(&tp_ice->remote_rtp, addr_text,
+					sizeof(addr_text), 3)));
+
+	    if (tp_ice->use_rtcp_mux) {
+	    	pj_sockaddr_cp(&tp_ice->remote_rtcp, &tp_ice->remote_rtp);
+	    } else if (!pj_sockaddr_has_addr(&tp_ice->rtcp_src_addr)) {
+	        /* Also update remote RTCP address if actual RTCP source
+	         * address is not heard yet.
+	         */
+		pj_uint16_t port;
+
+		pj_sockaddr_cp(&tp_ice->remote_rtcp, &tp_ice->remote_rtp);
+
+		port = (pj_uint16_t)
+		       (pj_sockaddr_get_port(&tp_ice->remote_rtp)+1);
+		pj_sockaddr_set_port(&tp_ice->remote_rtcp, port);
+
+		PJ_LOG(4,(tp_ice->base.name,
+			  "Remote RTCP address switched to predicted "
+			  "address %s",
+			  pj_sockaddr_print(&tp_ice->remote_rtcp, 
+					    addr_text,
+					    sizeof(addr_text), 3)));
+	    }
+	}
+#endif
 
     } else if (comp_id==2 && tp_ice->rtcp_cb) {
 
+#if defined(PJMEDIA_TRANSPORT_SWITCH_REMOTE_ADDR) && \
+    (PJMEDIA_TRANSPORT_SWITCH_REMOTE_ADDR == 1)
 	/* Check if RTCP source address is the same as the configured
 	 * remote address, and switch the address when they are
 	 * different.
@@ -1790,7 +2053,7 @@ static void ice_on_rx_data(pj_ice_strans *ice_st, unsigned comp_id,
 	    if (pj_sockaddr_cmp(&tp_ice->remote_rtcp, src_addr) == 0) {
 		tp_ice->rtcp_src_cnt = 0;
 	    } else {
-		char addr_text[80];
+		char addr_text[PJ_INET6_ADDRSTRLEN+10];
 
 		++tp_ice->rtcp_src_cnt;
 		if (tp_ice->rtcp_src_cnt < PJMEDIA_RTCP_NAT_PROBATION_CNT) {
@@ -1810,6 +2073,7 @@ static void ice_on_rx_data(pj_ice_strans *ice_st, unsigned comp_id,
 		}
 	    }
 	}
+#endif
 
 	if (!discard)
 	    (*tp_ice->rtcp_cb)(tp_ice->stream, pkt, size);
@@ -1824,12 +2088,31 @@ static void ice_on_ice_complete(pj_ice_strans *ice_st,
 			        pj_status_t result)
 {
     struct transport_ice *tp_ice;
+    ice_listener *il;
 
     tp_ice = (struct transport_ice*) pj_ice_strans_get_user_data(ice_st);
+    if (!tp_ice) {
+	/* Destroy on progress */
+	return;
+    }
+
+    pj_perror(5, tp_ice->base.name, result, "ICE operation complete"
+	      " (op=%d%s)", op,
+	      (op==PJ_ICE_STRANS_OP_INIT? "/initialization" :
+	      (op==PJ_ICE_STRANS_OP_NEGOTIATION? "/negotiation":"")));
 
     /* Notify application */
     if (tp_ice->cb.on_ice_complete)
 	(*tp_ice->cb.on_ice_complete)(&tp_ice->base, op, result);
+
+    for (il=tp_ice->listener.next; il!=&tp_ice->listener; il=il->next) {
+	if (il->cb.on_ice_complete2) {
+	    (*il->cb.on_ice_complete2)(&tp_ice->base, op, result,
+				       il->user_data);
+	} else if (il->cb.on_ice_complete) {
+	    (*il->cb.on_ice_complete)(&tp_ice->base, op, result);
+	}
+    }
 }
 
 
@@ -1851,6 +2134,11 @@ static pj_status_t transport_simulate_lost(pjmedia_transport *tp,
     return PJ_SUCCESS;
 }
 
+static void tp_ice_on_destroy(void *arg)
+{
+    struct transport_ice *tp_ice = (struct transport_ice*)arg;
+    pj_pool_safe_release(&tp_ice->pool);
+}
 
 /*
  * Destroy ICE media transport.
@@ -1859,15 +2147,20 @@ static pj_status_t transport_destroy(pjmedia_transport *tp)
 {
     struct transport_ice *tp_ice = (struct transport_ice*)tp;
 
+    /* Reset callback and user data */
+    pj_bzero(&tp_ice->cb, sizeof(tp_ice->cb));
+    tp_ice->base.user_data = NULL;
+    tp_ice->rtp_cb = NULL;
+    tp_ice->rtp_cb2 = NULL;
+    tp_ice->rtcp_cb = NULL;
+
     if (tp_ice->ice_st) {
+	pj_grp_lock_t *grp_lock = pj_ice_strans_get_grp_lock(tp_ice->ice_st);
 	pj_ice_strans_destroy(tp_ice->ice_st);
 	tp_ice->ice_st = NULL;
-    }
-
-    if (tp_ice->pool) {
-	pj_pool_t *pool = tp_ice->pool;
-	tp_ice->pool = NULL;
-	pj_pool_release(pool);
+	pj_grp_lock_dec_ref(grp_lock);
+    } else {
+	tp_ice_on_destroy(tp);
     }
 
     return PJ_SUCCESS;

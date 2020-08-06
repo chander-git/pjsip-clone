@@ -334,6 +334,17 @@ PJ_DEF(pj_status_t) pj_ioqueue_register_sock2(pj_pool_t *pool,
     PJ_ASSERT_RETURN(pool && ioqueue && sock != PJ_INVALID_SOCKET &&
                      cb && p_key, PJ_EINVAL);
 
+    /* On platforms with fd_set containing fd bitmap such as *nix family,
+     * avoid potential memory corruption caused by select() when given
+     * an fd that is higher than FD_SETSIZE.
+     */
+    if (sizeof(fd_set) < FD_SETSIZE && sock >= FD_SETSIZE) {
+	PJ_LOG(4, ("pjlib", "Failed to register socket to ioqueue because "
+		   	    "socket fd is too big (fd=%d/FD_SETSIZE=%d)",
+		   	    sock, FD_SETSIZE));
+    	return PJ_ETOOBIG;
+    }
+
     pj_lock_acquire(ioqueue->lock);
 
     if (ioqueue->count >= ioqueue->max) {
@@ -467,11 +478,26 @@ PJ_DEF(pj_status_t) pj_ioqueue_unregister( pj_ioqueue_key_t *key)
      */
     pj_ioqueue_lock_key(key);
 
+    /* Best effort to avoid double key-unregistration */
+    if (IS_CLOSING(key)) {
+	pj_ioqueue_unlock_key(key);
+	return PJ_SUCCESS;
+    }
+
     /* Also lock ioqueue */
     pj_lock_acquire(ioqueue->lock);
 
-    pj_assert(ioqueue->count > 0);
-    --ioqueue->count;
+    /* Avoid "negative" ioqueue count */
+    if (ioqueue->count > 0) {
+	--ioqueue->count;
+    } else {
+	/* If this happens, very likely there is double unregistration
+	 * of a key.
+	 */
+	pj_assert(!"Bad ioqueue count in key unregistration!");
+	PJ_LOG(1,(THIS_FILE, "Bad ioqueue count in key unregistration!"));
+    }
+
 #if !PJ_IOQUEUE_HAS_SAFE_UNREG
     /* Ticket #520, key will be erased more than once */
     pj_list_erase(key);
@@ -483,7 +509,10 @@ PJ_DEF(pj_status_t) pj_ioqueue_unregister( pj_ioqueue_key_t *key)
 #endif
 
     /* Close socket. */
-    pj_sock_close(key->fd);
+    if (key->fd != PJ_INVALID_SOCKET) {
+        pj_sock_close(key->fd);
+        key->fd = PJ_INVALID_SOCKET;
+    }
 
     /* Clear callback */
     key->cb.on_accept_complete = NULL;
@@ -696,71 +725,122 @@ static pj_status_t replace_udp_sock(pj_ioqueue_key_t *h)
 
     old_sock = h->fd;
 
+    fds_cnt = 0;
+    fds[fds_cnt++] = &h->ioqueue->rfdset;
+    fds[fds_cnt++] = &h->ioqueue->wfdset;
+#if PJ_HAS_TCP
+    fds[fds_cnt++] = &h->ioqueue->xfdset;
+#endif
+
     /* Can only replace UDP socket */
     pj_assert(h->fd_type == pj_SOCK_DGRAM());
 
     PJ_LOG(4,(THIS_FILE, "Attempting to replace UDP socket %d", old_sock));
 
-    /* Investigate the old socket */
-    addr_len = sizeof(local_addr);
-    status = pj_sock_getsockname(old_sock, &local_addr, &addr_len);
-    if (status != PJ_SUCCESS)
-	goto on_error;
+    for (msec=20; (msec<1000 && status != PJ_SUCCESS) ;
+         msec<1000? msec=msec*2 : 1000)
+    {
+        if (msec > 20) {
+            PJ_LOG(4,(THIS_FILE, "Retry to replace UDP socket %d", old_sock));
+            pj_thread_sleep(msec);
+        }
+        
+        if (old_sock != PJ_INVALID_SOCKET) {
+            /* Investigate the old socket */
+            addr_len = sizeof(local_addr);
+            status = pj_sock_getsockname(old_sock, &local_addr, &addr_len);
+            if (status != PJ_SUCCESS) {
+                PJ_PERROR(5,(THIS_FILE, status, "Error get socket name"));
+            	continue;
+            }
+        
+            addr_len = sizeof(rem_addr);
+            status = pj_sock_getpeername(old_sock, &rem_addr, &addr_len);
+            if (status != PJ_SUCCESS) {
+                PJ_PERROR(5,(THIS_FILE, status, "Error get peer name"));
+            } else {
+            	flags |= HAS_PEER_ADDR;
+            }
+
+            status = pj_sock_get_qos_params(old_sock, &qos_params);
+            if (status == PJ_STATUS_FROM_OS(EBADF) ||
+                status == PJ_STATUS_FROM_OS(EINVAL))
+            {
+            	PJ_PERROR(5,(THIS_FILE, status, "Error get qos param"));
+            	continue;
+            }
+        
+            if (status != PJ_SUCCESS) {
+            	PJ_PERROR(5,(THIS_FILE, status, "Error get qos param"));
+            } else {
+            	flags |= HAS_QOS;
+            }
+
+            /* We're done with the old socket, close it otherwise we'll get
+             * error in bind()
+             */
+            status = pj_sock_close(old_sock);
+       	    if (status != PJ_SUCCESS) {
+                PJ_PERROR(5,(THIS_FILE, status, "Error closing socket"));
+            }
+            
+            old_sock = PJ_INVALID_SOCKET;
+        }
+
+        /* Prepare the new socket */
+        status = pj_sock_socket(local_addr.addr.sa_family, PJ_SOCK_DGRAM, 0,
+                                &new_sock);
+        if (status != PJ_SUCCESS) {
+            PJ_PERROR(5,(THIS_FILE, status, "Error create socket"));
+            continue;
+        }
+
+        /* Even after the socket is closed, we'll still get "Address in use"
+         * errors, so force it with SO_REUSEADDR
+         */
+        val = 1;
+        status = pj_sock_setsockopt(new_sock, SOL_SOCKET, SO_REUSEADDR,
+                                    &val, sizeof(val));
+        if (status == PJ_STATUS_FROM_OS(EBADF) ||
+            status == PJ_STATUS_FROM_OS(EINVAL))
+        {
+            PJ_PERROR(5,(THIS_FILE, status, "Error set socket option"));
+            continue;
+        }
+
+        /* The loop is silly, but what else can we do? */
+        addr_len = pj_sockaddr_get_len(&local_addr);
+        for (msec=20; msec<1000 ; msec<1000? msec=msec*2 : 1000) {
+            status = pj_sock_bind(new_sock, &local_addr, addr_len);
+            if (status != PJ_STATUS_FROM_OS(EADDRINUSE))
+                break;
+            PJ_LOG(4,(THIS_FILE, "Address is still in use, retrying.."));
+            pj_thread_sleep(msec);
+        }
+
+        if (status != PJ_SUCCESS)
+            continue;
+
+        if (flags & HAS_QOS) {
+            status = pj_sock_set_qos_params(new_sock, &qos_params);
+            if (status == PJ_STATUS_FROM_OS(EINVAL)) {
+                PJ_PERROR(5,(THIS_FILE, status, "Error set qos param"));
+                continue;
+            }
+        }
+
+        if (flags & HAS_PEER_ADDR) {
+            status = pj_sock_connect(new_sock, &rem_addr, addr_len);
+            if (status != PJ_SUCCESS) {
+                PJ_PERROR(5,(THIS_FILE, status, "Error connect socket"));
+                continue;
+            }
+        }
+    }
     
-    addr_len = sizeof(rem_addr);
-    status = pj_sock_getpeername(old_sock, &rem_addr, &addr_len);
-    if (status == PJ_SUCCESS)
-	flags |= HAS_PEER_ADDR;
-
-    status = pj_sock_get_qos_params(old_sock, &qos_params);
-    if (status == PJ_SUCCESS)
-	flags |= HAS_QOS;
-
-    /* We're done with the old socket, close it otherwise we'll get
-     * error in bind()
-     */
-    pj_sock_close(old_sock);
-
-    /* Prepare the new socket */
-    status = pj_sock_socket(local_addr.addr.sa_family, PJ_SOCK_DGRAM, 0,
-			    &new_sock);
     if (status != PJ_SUCCESS)
-	goto on_error;
-
-    /* Even after the socket is closed, we'll still get "Address in use"
-     * errors, so force it with SO_REUSEADDR
-     */
-    val = 1;
-    status = pj_sock_setsockopt(new_sock, SOL_SOCKET, SO_REUSEADDR,
-				&val, sizeof(val));
-    if (status != PJ_SUCCESS)
-	goto on_error;
-
-    /* The loop is silly, but what else can we do? */
-    addr_len = pj_sockaddr_get_len(&local_addr);
-    for (msec=20; ; msec<1000? msec=msec*2 : 1000) {
-	status = pj_sock_bind(new_sock, &local_addr, addr_len);
-	if (status != PJ_STATUS_FROM_OS(EADDRINUSE))
-	    break;
-	PJ_LOG(4,(THIS_FILE, "Address is still in use, retrying.."));
-	pj_thread_sleep(msec);
-    }
-
-    if (status != PJ_SUCCESS)
-	goto on_error;
-
-    if (flags & HAS_QOS) {
-	status = pj_sock_set_qos_params(new_sock, &qos_params);
-	if (status != PJ_SUCCESS)
-	    goto on_error;
-    }
-
-    if (flags & HAS_PEER_ADDR) {
-	status = pj_sock_connect(new_sock, &rem_addr, addr_len);
-	if (status != PJ_SUCCESS)
-	    goto on_error;
-    }
-
+        goto on_error;
+    
     /* Set socket to nonblocking. */
     val = 1;
 #if defined(PJ_WIN32) && PJ_WIN32!=0 || \
@@ -777,16 +857,9 @@ static pj_status_t replace_udp_sock(pj_ioqueue_key_t *h)
     /* Replace the occurrence of old socket with new socket in the
      * fd sets.
      */
-    fds_cnt = 0;
-    fds[fds_cnt++] = &h->ioqueue->rfdset;
-    fds[fds_cnt++] = &h->ioqueue->wfdset;
-#if PJ_HAS_TCP
-    fds[fds_cnt++] = &h->ioqueue->xfdset;
-#endif
-
     for (i=0; i<fds_cnt; ++i) {
-	if (PJ_FD_ISSET(old_sock, fds[i])) {
-	    PJ_FD_CLR(old_sock, fds[i]);
+	if (PJ_FD_ISSET(h->fd, fds[i])) {
+	    PJ_FD_CLR(h->fd, fds[i]);
 	    PJ_FD_SET(new_sock, fds[i]);
 	}
     }
@@ -803,9 +876,20 @@ static pj_status_t replace_udp_sock(pj_ioqueue_key_t *h)
 on_error:
     if (new_sock != PJ_INVALID_SOCKET)
 	pj_sock_close(new_sock);
-    PJ_PERROR(1,(THIS_FILE, status, "Error replacing socket"));
+    if (old_sock != PJ_INVALID_SOCKET)
+    	pj_sock_close(old_sock);
+
+    /* Clear the occurrence of old socket in the fd sets. */
+    for (i=0; i<fds_cnt; ++i) {
+	if (PJ_FD_ISSET(h->fd, fds[i])) {
+	    PJ_FD_CLR(h->fd, fds[i]);
+	}
+    }
+
+    h->fd = PJ_INVALID_SOCKET;
+    PJ_PERROR(1,(THIS_FILE, status, "Error replacing socket %d", old_sock));
     pj_lock_release(h->ioqueue->lock);
-    return status;
+    return PJ_ESOCKETSTOP;
 }
 #endif
 
@@ -830,13 +914,15 @@ on_error:
 PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
 {
     pj_fd_set_t rfdset, wfdset, xfdset;
-    int count, i, counter;
+    int nfds;
+    int i, count, event_cnt, processed_cnt;
     pj_ioqueue_key_t *h;
+    enum { MAX_EVENTS = PJ_IOQUEUE_MAX_CAND_EVENTS };
     struct event
     {
         pj_ioqueue_key_t	*key;
         enum ioqueue_event_type  event_type;
-    } event[PJ_IOQUEUE_MAX_EVENTS_IN_SINGLE_POLL];
+    } event[MAX_EVENTS];
 
     PJ_ASSERT_RETURN(ioqueue, -PJ_EINVAL);
 
@@ -876,18 +962,31 @@ PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
     validate_sets(ioqueue, &rfdset, &wfdset, &xfdset);
 #endif
 
+    nfds = ioqueue->nfds;
+
     /* Unlock ioqueue before select(). */
     pj_lock_release(ioqueue->lock);
 
-    count = pj_sock_select(ioqueue->nfds+1, &rfdset, &wfdset, &xfdset, 
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    count = 0;
+    __try {
+#endif
+
+    count = pj_sock_select(nfds+1, &rfdset, &wfdset, &xfdset, 
 			   timeout);
+
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    /* Ignore Invalid Handle Exception raised by select().*/
+    }
+    __except (GetExceptionCode() == STATUS_INVALID_HANDLE ?
+	      EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH) {
+    }
+#endif    
     
     if (count == 0)
 	return 0;
     else if (count < 0)
 	return -pj_get_netos_error();
-    else if (count > PJ_IOQUEUE_MAX_EVENTS_IN_SINGLE_POLL)
-        count = PJ_IOQUEUE_MAX_EVENTS_IN_SINGLE_POLL;
 
     /* Scan descriptor sets for event and add the events in the event
      * array to be processed later in this function. We do this so that
@@ -895,13 +994,17 @@ PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
      */
     pj_lock_acquire(ioqueue->lock);
 
-    counter = 0;
+    event_cnt = 0;
 
     /* Scan for writable sockets first to handle piggy-back data
      * coming with accept().
      */
-    h = ioqueue->active_list.next;
-    for ( ; h!=&ioqueue->active_list && counter<count; h = h->next) {
+    for (h = ioqueue->active_list.next;
+	 h != &ioqueue->active_list && event_cnt < MAX_EVENTS;
+	 h = h->next)
+    {
+	if (h->fd == PJ_INVALID_SOCKET)
+	    continue;
 
 	if ( (key_has_pending_write(h) || key_has_pending_connect(h))
 	     && PJ_FD_ISSET(h->fd, &wfdset) && !IS_CLOSING(h))
@@ -909,39 +1012,39 @@ PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
 #if PJ_IOQUEUE_HAS_SAFE_UNREG
 	    increment_counter(h);
 #endif
-            event[counter].key = h;
-            event[counter].event_type = WRITEABLE_EVENT;
-            ++counter;
+            event[event_cnt].key = h;
+            event[event_cnt].event_type = WRITEABLE_EVENT;
+            ++event_cnt;
         }
 
         /* Scan for readable socket. */
 	if ((key_has_pending_read(h) || key_has_pending_accept(h))
             && PJ_FD_ISSET(h->fd, &rfdset) && !IS_CLOSING(h) &&
-	    counter<count)
+	    event_cnt < MAX_EVENTS)
         {
 #if PJ_IOQUEUE_HAS_SAFE_UNREG
 	    increment_counter(h);
 #endif
-            event[counter].key = h;
-            event[counter].event_type = READABLE_EVENT;
-            ++counter;
+            event[event_cnt].key = h;
+            event[event_cnt].event_type = READABLE_EVENT;
+            ++event_cnt;
 	}
 
 #if PJ_HAS_TCP
         if (key_has_pending_connect(h) && PJ_FD_ISSET(h->fd, &xfdset) &&
-	    !IS_CLOSING(h) && counter<count) 
+	    !IS_CLOSING(h) && event_cnt < MAX_EVENTS)
 	{
 #if PJ_IOQUEUE_HAS_SAFE_UNREG
 	    increment_counter(h);
 #endif
-            event[counter].key = h;
-            event[counter].event_type = EXCEPTION_EVENT;
-            ++counter;
+            event[event_cnt].key = h;
+            event[event_cnt].event_type = EXCEPTION_EVENT;
+            ++event_cnt;
         }
 #endif
     }
 
-    for (i=0; i<counter; ++i) {
+    for (i=0; i<event_cnt; ++i) {
 	if (event[i].key->grp_lock)
 	    pj_grp_lock_add_ref_dbg(event[i].key->grp_lock, "ioqueue", 0);
     }
@@ -952,37 +1055,46 @@ PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
 
     PJ_RACE_ME(5);
 
-    count = counter;
+    processed_cnt = 0;
 
     /* Now process all events. The dispatch functions will take care
      * of locking in each of the key
      */
-    for (counter=0; counter<count; ++counter) {
-        switch (event[counter].event_type) {
-        case READABLE_EVENT:
-            ioqueue_dispatch_read_event(ioqueue, event[counter].key);
-            break;
-        case WRITEABLE_EVENT:
-            ioqueue_dispatch_write_event(ioqueue, event[counter].key);
-            break;
-        case EXCEPTION_EVENT:
-            ioqueue_dispatch_exception_event(ioqueue, event[counter].key);
-            break;
-        case NO_EVENT:
-            pj_assert(!"Invalid event!");
-            break;
-        }
+    for (i=0; i<event_cnt; ++i) {
+
+	/* Just do not exceed PJ_IOQUEUE_MAX_EVENTS_IN_SINGLE_POLL */
+	if (processed_cnt < PJ_IOQUEUE_MAX_EVENTS_IN_SINGLE_POLL) {
+	    switch (event[i].event_type) {
+	    case READABLE_EVENT:
+		if (ioqueue_dispatch_read_event(ioqueue, event[i].key))
+		    ++processed_cnt;
+		break;
+	    case WRITEABLE_EVENT:
+		if (ioqueue_dispatch_write_event(ioqueue, event[i].key))
+		    ++processed_cnt;
+		break;
+	    case EXCEPTION_EVENT:
+		if (ioqueue_dispatch_exception_event(ioqueue, event[i].key))
+		    ++processed_cnt;
+		break;
+	    case NO_EVENT:
+		pj_assert(!"Invalid event!");
+		break;
+	    }
+	}
 
 #if PJ_IOQUEUE_HAS_SAFE_UNREG
-	decrement_counter(event[counter].key);
+	decrement_counter(event[i].key);
 #endif
 
-	if (event[counter].key->grp_lock)
-	    pj_grp_lock_dec_ref_dbg(event[counter].key->grp_lock,
+	if (event[i].key->grp_lock)
+	    pj_grp_lock_dec_ref_dbg(event[i].key->grp_lock,
 	                            "ioqueue", 0);
     }
 
+    TRACE__((THIS_FILE, "     poll: count=%d events=%d processed=%d",
+	     count, event_cnt, processed_cnt));
 
-    return count;
+    return processed_cnt;
 }
 

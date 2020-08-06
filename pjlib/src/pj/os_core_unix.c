@@ -39,6 +39,10 @@
 #  include <semaphore.h>
 #endif
 
+#if defined(PJ_SEMAPHORE_USE_DISPATCH_SEM) && PJ_SEMAPHORE_USE_DISPATCH_SEM != 0
+#  include <dispatch/dispatch.h>
+#endif
+
 #include <unistd.h>	    // getpid()
 #include <errno.h>	    // errno
 
@@ -107,7 +111,11 @@ struct pj_mutex_t
 #if defined(PJ_HAS_SEMAPHORE) && PJ_HAS_SEMAPHORE != 0
 struct pj_sem_t
 {
+#if defined(PJ_SEMAPHORE_USE_DISPATCH_SEM) && PJ_SEMAPHORE_USE_DISPATCH_SEM != 0
+    dispatch_semaphore_t sem;
+#else
     sem_t	       *sem;
+#endif
     char		obj_name[PJ_MAX_OBJ_NAME];
 };
 #endif /* PJ_HAS_SEMAPHORE */
@@ -717,6 +725,9 @@ PJ_DEF(pj_status_t) pj_thread_join(pj_thread_t *p)
 
     PJ_CHECK_STACK();
 
+    if (p == pj_thread_this())
+	return PJ_ECANCELLED;
+
     PJ_LOG(6, (pj_thread_this()->obj_name, "Joining thread %s", p->obj_name));
     result = pthread_join( rec->thread, &ret);
 
@@ -876,9 +887,16 @@ PJ_DEF(pj_status_t) pj_atomic_create( pj_pool_t *pool,
  */
 PJ_DEF(pj_status_t) pj_atomic_destroy( pj_atomic_t *atomic_var )
 {
+    pj_status_t status;
+
     PJ_ASSERT_RETURN(atomic_var, PJ_EINVAL);
+    
 #if PJ_HAS_THREADS
-    return pj_mutex_destroy( atomic_var->mutex );
+    status = pj_mutex_destroy( atomic_var->mutex );
+    if (status == PJ_SUCCESS) {
+        atomic_var->mutex = NULL;
+    }
+    return status;
 #else
     return 0;
 #endif
@@ -889,10 +907,16 @@ PJ_DEF(pj_status_t) pj_atomic_destroy( pj_atomic_t *atomic_var )
  */
 PJ_DEF(void) pj_atomic_set(pj_atomic_t *atomic_var, pj_atomic_value_t value)
 {
+    pj_status_t status;
+
     PJ_CHECK_STACK();
+    PJ_ASSERT_ON_FAIL(atomic_var, return);
 
 #if PJ_HAS_THREADS
-    pj_mutex_lock( atomic_var->mutex );
+    status = pj_mutex_lock( atomic_var->mutex );
+    if (status != PJ_SUCCESS) {
+        return;
+    }
 #endif
     atomic_var->value = value;
 #if PJ_HAS_THREADS
@@ -943,6 +967,7 @@ PJ_DEF(pj_atomic_value_t) pj_atomic_inc_and_get(pj_atomic_t *atomic_var)
  */
 PJ_DEF(void) pj_atomic_inc(pj_atomic_t *atomic_var)
 {
+    PJ_ASSERT_ON_FAIL(atomic_var, return);
     pj_atomic_inc_and_get(atomic_var);
 }
 
@@ -971,6 +996,7 @@ PJ_DEF(pj_atomic_value_t) pj_atomic_dec_and_get(pj_atomic_t *atomic_var)
  */
 PJ_DEF(void) pj_atomic_dec(pj_atomic_t *atomic_var)
 {
+    PJ_ASSERT_ON_FAIL(atomic_var, return);
     pj_atomic_dec_and_get(atomic_var);
 }
 
@@ -1002,6 +1028,7 @@ PJ_DEF(pj_atomic_value_t) pj_atomic_add_and_get( pj_atomic_t *atomic_var,
 PJ_DEF(void) pj_atomic_add( pj_atomic_t *atomic_var,
                             pj_atomic_value_t value )
 {
+    PJ_ASSERT_ON_FAIL(atomic_var, return);
     pj_atomic_add_and_get(atomic_var, value);
 }
 
@@ -1122,7 +1149,7 @@ static pj_status_t init_mutex(pj_mutex_t *mutex, const char *name, int type)
     if (type == PJ_MUTEX_SIMPLE) {
 #if (defined(PJ_LINUX) && PJ_LINUX!=0) || \
     defined(PJ_HAS_PTHREAD_MUTEXATTR_SETTYPE)
-	rc = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_FAST_NP);
+	rc = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_NORMAL);
 #elif (defined(PJ_RTEMS) && PJ_RTEMS!=0) || \
        defined(PJ_PTHREAD_MUTEXATTR_T_HAS_RECURSIVE)
 	/* Nothing to do, default is simple */
@@ -1132,7 +1159,7 @@ static pj_status_t init_mutex(pj_mutex_t *mutex, const char *name, int type)
     } else {
 #if (defined(PJ_LINUX) && PJ_LINUX!=0) || \
      defined(PJ_HAS_PTHREAD_MUTEXATTR_SETTYPE)
-	rc = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE_NP);
+	rc = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
 #elif (defined(PJ_RTEMS) && PJ_RTEMS!=0) || \
        defined(PJ_PTHREAD_MUTEXATTR_T_HAS_RECURSIVE)
 	// Phil Torre <ptorre@zetron.com>:
@@ -1170,6 +1197,7 @@ static pj_status_t init_mutex(pj_mutex_t *mutex, const char *name, int type)
     /* Set owner. */
     mutex->nesting_level = 0;
     mutex->owner = NULL;
+    mutex->owner_name[0] = '\0';
 #endif
 
     /* Set name. */
@@ -1549,6 +1577,11 @@ PJ_DEF(pj_status_t) pj_sem_create( pj_pool_t *pool,
     PJ_ASSERT_RETURN(sem, PJ_ENOMEM);
 
 #if defined(PJ_DARWINOS) && PJ_DARWINOS!=0
+#   if defined(PJ_SEMAPHORE_USE_DISPATCH_SEM) && PJ_SEMAPHORE_USE_DISPATCH_SEM != 0
+    sem->sem = dispatch_semaphore_create(initial);
+    if (sem->sem == NULL)
+        return PJ_RETURN_OS_ERROR(pj_get_native_os_error());
+#   else
     /* MacOS X doesn't support anonymous semaphore */
     {
 	char sem_name[PJ_GUID_MAX_LENGTH+1];
@@ -1579,6 +1612,7 @@ PJ_DEF(pj_status_t) pj_sem_create( pj_pool_t *pool,
 	/* And immediately release the name as we don't need it */
 	sem_unlink(sem_name);
     }
+#   endif
 #else
     sem->sem = PJ_POOL_ALLOC_T(pool, sem_t);
     if (sem_init( sem->sem, 0, initial) != 0)
@@ -1612,7 +1646,7 @@ PJ_DEF(pj_status_t) pj_sem_create( pj_pool_t *pool,
 PJ_DEF(pj_status_t) pj_sem_wait(pj_sem_t *sem)
 {
 #if PJ_HAS_THREADS
-    int result;
+    long result;
 
     PJ_CHECK_STACK();
     PJ_ASSERT_RETURN(sem, PJ_EINVAL);
@@ -1620,7 +1654,11 @@ PJ_DEF(pj_status_t) pj_sem_wait(pj_sem_t *sem)
     PJ_LOG(6, (sem->obj_name, "Semaphore: thread %s is waiting",
 			      pj_thread_this()->obj_name));
 
+#if defined(PJ_SEMAPHORE_USE_DISPATCH_SEM) && PJ_SEMAPHORE_USE_DISPATCH_SEM != 0
+    result = dispatch_semaphore_wait(sem->sem, DISPATCH_TIME_FOREVER);
+#else
     result = sem_wait( sem->sem );
+#endif
 
     if (result == 0) {
 	PJ_LOG(6, (sem->obj_name, "Semaphore acquired by thread %s",
@@ -1646,12 +1684,16 @@ PJ_DEF(pj_status_t) pj_sem_wait(pj_sem_t *sem)
 PJ_DEF(pj_status_t) pj_sem_trywait(pj_sem_t *sem)
 {
 #if PJ_HAS_THREADS
-    int result;
+    long result;
 
     PJ_CHECK_STACK();
     PJ_ASSERT_RETURN(sem, PJ_EINVAL);
 
+#if defined(PJ_SEMAPHORE_USE_DISPATCH_SEM) && PJ_SEMAPHORE_USE_DISPATCH_SEM != 0
+    result = dispatch_semaphore_wait(sem->sem, DISPATCH_TIME_NOW);
+#else
     result = sem_trywait( sem->sem );
+#endif
 
     if (result == 0) {
 	PJ_LOG(6, (sem->obj_name, "Semaphore acquired by thread %s",
@@ -1676,7 +1718,12 @@ PJ_DEF(pj_status_t) pj_sem_post(pj_sem_t *sem)
     int result;
     PJ_LOG(6, (sem->obj_name, "Semaphore released by thread %s",
 			      pj_thread_this()->obj_name));
+#if defined(PJ_SEMAPHORE_USE_DISPATCH_SEM) && PJ_SEMAPHORE_USE_DISPATCH_SEM != 0
+    dispatch_semaphore_signal(sem->sem);
+    result = 0;
+#else
     result = sem_post( sem->sem );
+#endif
 
     if (result == 0)
 	return PJ_SUCCESS;
@@ -1702,7 +1749,12 @@ PJ_DEF(pj_status_t) pj_sem_destroy(pj_sem_t *sem)
     PJ_LOG(6, (sem->obj_name, "Semaphore destroyed by thread %s",
 			      pj_thread_this()->obj_name));
 #if defined(PJ_DARWINOS) && PJ_DARWINOS!=0
+#   if defined(PJ_SEMAPHORE_USE_DISPATCH_SEM) && PJ_SEMAPHORE_USE_DISPATCH_SEM != 0
+    dispatch_release(sem->sem);
+    result = 0;
+#   else
     result = sem_close( sem->sem );
+#   endif
 #else
     result = sem_destroy( sem->sem );
 #endif

@@ -93,6 +93,21 @@ enum pj_stun_method_e
     PJ_STUN_CHANNEL_BIND_METHOD		    = 9,
 
     /**
+     * STUN/TURN Connect as defined by RFC 6062
+     */
+    PJ_STUN_CONNECT_METHOD		    = 10,
+
+    /**
+     * STUN/TURN ConnectionBind as defined by RFC 6062
+     */
+    PJ_STUN_CONNECTION_BIND_METHOD	    = 11,
+
+    /**
+     * STUN/TURN ConnectionAttempt as defined by RFC 6062
+     */
+    PJ_STUN_CONNECTION_ATTEMPT_METHOD	    = 12,
+
+    /**
      * All known methods.
      */
     PJ_STUN_METHOD_MAX
@@ -291,7 +306,18 @@ typedef enum pj_stun_msg_type
     /**
      * Error response to STUN ChannelBind request.
      */
-    PJ_STUN_CHANNEL_BIND_ERROR_RESPONSE	    = 0x0119
+    PJ_STUN_CHANNEL_BIND_ERROR_RESPONSE	    = 0x0119,
+
+
+    /**
+     * STUN/TURN ConnectBind Request
+     */
+    PJ_STUN_CONNECTION_BIND_REQUEST	    = 0x000b,
+
+    /**
+     * TURN ConnectionAttempt indication
+     */
+    PJ_STUN_CONNECTION_ATTEMPT_INDICATION   = 0x001c,
 
 } pj_stun_msg_type;
 
@@ -323,6 +349,7 @@ typedef enum pj_stun_attr_type
     PJ_STUN_ATTR_NONCE		    = 0x0015,/**< NONCE attribute.	    */
     PJ_STUN_ATTR_XOR_RELAYED_ADDR   = 0x0016,/**< TURN XOR-RELAYED-ADDRESS  */
     PJ_STUN_ATTR_REQ_ADDR_TYPE	    = 0x0017,/**< REQUESTED-ADDRESS-TYPE    */
+    PJ_STUN_ATTR_REQ_ADDR_FAMILY    = 0x0017,/**< REQUESTED-ADDRESS-FAMILY  */
     PJ_STUN_ATTR_EVEN_PORT	    = 0x0018,/**< TURN EVEN-PORT	    */
     PJ_STUN_ATTR_REQ_TRANSPORT	    = 0x0019,/**< TURN REQUESTED-TRANSPORT  */
     PJ_STUN_ATTR_DONT_FRAGMENT	    = 0x001A,/**< TURN DONT-FRAGMENT	    */
@@ -332,6 +359,7 @@ typedef enum pj_stun_attr_type
     PJ_STUN_ATTR_XOR_REFLECTED_FROM = 0x0023,/**< XOR-REFLECTED-FROM	    */
     PJ_STUN_ATTR_PRIORITY	    = 0x0024,/**< PRIORITY		    */
     PJ_STUN_ATTR_USE_CANDIDATE	    = 0x0025,/**< USE-CANDIDATE		    */
+    PJ_STUN_ATTR_CONNECTION_ID	    = 0x002a,/**< CONNECTION-ID		    */
     PJ_STUN_ATTR_ICMP		    = 0x0030,/**< ICMP (TURN)		    */
 
     PJ_STUN_ATTR_END_MANDATORY_ATTR,
@@ -963,10 +991,11 @@ typedef struct pj_stun_sockaddr_attr pj_stun_xor_relayed_addr_attr;
 
 
 /**
- * This describes the REQUESTED-ADDRESS-TYPE attribute.
- * The REQUESTED-ADDRESS-TYPE attribute is used by clients to request
+ * According to RFC 6156, this describes the REQUESTED-ADDRESS-FAMILY
+ * attribute (formerly known as REQUESTED-ADDRESS-TYPE in the draft).
+ * The REQUESTED-ADDRESS-FAMILY attribute is used by clients to request
  * the allocation of a specific address type from a server.  The
- * following is the format of the REQUESTED-ADDRESS-TYPE attribute.
+ * following is the format of the REQUESTED-ADDRESS-FAMILY attribute.
 
  \verbatim
 

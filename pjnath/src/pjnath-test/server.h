@@ -39,12 +39,18 @@ enum test_server_flags
     CREATE_DNS_SERVER		= (1 << 0),
     CREATE_A_RECORD_FOR_DOMAIN	= (1 << 1),
 
-    CREATE_STUN_SERVER		= (1 << 5),
-    CREATE_STUN_SERVER_DNS_SRV	= (1 << 6),
+    CREATE_STUN_SERVER		= (1 << 4),
+    CREATE_STUN_SERVER_DNS_SRV	= (1 << 5),
 
-    CREATE_TURN_SERVER		= (1 << 10),
-    CREATE_TURN_SERVER_DNS_SRV	= (1 << 11),
+    CREATE_TURN_SERVER		= (1 << 8),
+    CREATE_TURN_SERVER_DNS_SRV	= (1 << 9),
 
+    SERVER_IPV4			= (1 << 12),
+    SERVER_IPV6			= (1 << 13),
+
+    TURN_UDP			= (1 << 16),
+    TURN_TCP			= (1 << 17),
+    TURN_TLS			= (1 << 18)
 };
 
 typedef struct test_server test_server;
@@ -80,6 +86,14 @@ struct test_server
     pj_activesock_t	*stun_sock;
 
     pj_activesock_t	*turn_sock;
+
+    pj_ssl_sock_t	*ssl_srv_sock;
+
+    pj_ssl_sock_t	*ssl_cl_sock;
+
+    pj_activesock_t	*cl_turn_sock;
+
+    pj_sockaddr		 remote_addr;
     unsigned		 turn_alloc_cnt;
     turn_allocation	 turn_alloc[MAX_TURN_ALLOC];
     pj_bool_t		 turn_respond_allocate;

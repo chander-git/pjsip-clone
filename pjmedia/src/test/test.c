@@ -64,15 +64,17 @@ int test_main(void)
     pj_caching_pool_init(&caching_pool, &pj_pool_factory_default_policy, 0);
     pool = pj_pool_create(&caching_pool.factory, "test", 1000, 512, NULL);
 
-    pj_log_set_decor(PJ_LOG_HAS_NEWLINE);
+    pj_log_set_decor(PJ_LOG_HAS_NEWLINE | PJ_LOG_HAS_TIME |
+		     PJ_LOG_HAS_MICRO_SEC | PJ_LOG_HAS_INDENT);
     pj_log_set_level(3);
 
     mem = &caching_pool.factory;
 
+    pjmedia_event_mgr_create(pool, 0, NULL);
+
 #if defined(PJMEDIA_HAS_VIDEO) && (PJMEDIA_HAS_VIDEO != 0)
     pjmedia_video_format_mgr_create(pool, 64, 0, NULL);
     pjmedia_converter_mgr_create(pool, NULL);
-    pjmedia_event_mgr_create(pool, 0, NULL);
     pjmedia_vid_codec_mgr_create(pool, NULL);
 #endif
 
@@ -116,9 +118,10 @@ on_return:
 #if defined(PJMEDIA_HAS_VIDEO) && (PJMEDIA_HAS_VIDEO != 0)
     pjmedia_video_format_mgr_destroy(pjmedia_video_format_mgr_instance());
     pjmedia_converter_mgr_destroy(pjmedia_converter_mgr_instance());
-    pjmedia_event_mgr_destroy(pjmedia_event_mgr_instance());
     pjmedia_vid_codec_mgr_destroy(pjmedia_vid_codec_mgr_instance());
 #endif
+
+    pjmedia_event_mgr_destroy(pjmedia_event_mgr_instance());
 
     pj_pool_release(pool);
     pj_caching_pool_destroy(&caching_pool);

@@ -64,7 +64,7 @@
 #	define s_addr  S_un.S_addr
 #   endif
 
-#   if !defined(IPPROTO_IPV6)
+#   if !defined(IPPROTO_IPV6) && (_WIN32_WINNT == 0x0500)
 	/* Need to download and install IPv6Kit for this platform.
 	 * Please see the comments above about Visual Studio 6.
 	 */
@@ -158,53 +158,33 @@
 #  define OSERR_EINPROGRESS    WSAEINPROGRESS
 #  define OSERR_ECONNRESET     WSAECONNRESET
 #  define OSERR_ENOTCONN       WSAENOTCONN
+#  define OSERR_EAFNOSUPPORT   WSAEAFNOSUPPORT
+#  define OSERR_ENOPROTOOPT    WSAENOPROTOOPT
 #elif defined(PJ_SYMBIAN) && PJ_SYMBIAN!=0
 #  define OSERR_EWOULDBLOCK    -1
 #  define OSERR_EINPROGRESS    -1
 #  define OSERR_ECONNRESET     -1
 #  define OSERR_ENOTCONN       -1
+#  define OSERR_EAFNOSUPPORT   -1
+#  define OSERR_ENOPROTOOPT    -1
 #else
 #  define OSERR_EWOULDBLOCK    EWOULDBLOCK
 #  define OSERR_EINPROGRESS    EINPROGRESS
 #  define OSERR_ECONNRESET     ECONNRESET
 #  define OSERR_ENOTCONN       ENOTCONN
+#  define OSERR_EAFNOSUPPORT   EAFNOSUPPORT
+#  define OSERR_ENOPROTOOPT    ENOPROTOOPT
 #endif
 
 
 /*
  * And undefine these..
+ * Note (see issue #2311): unfortunately, this may cause build failure
+ * to anyone who uses these standard macros.
  */
-#undef s_addr
-#undef s6_addr
-#undef sin_zero
-
-/*
- * Linux kernel specifics
- */
-#if defined(PJ_LINUX_KERNEL)
-#   include <linux/net.h>
-#   include <asm/ioctls.h>		/* FIONBIO	*/
-#   include <linux/syscalls.h>	/* sys_select() */
-#   include <asm/uaccess.h>	/* set/get_fs()	*/
-
-    typedef int socklen_t;
-#   define getsockopt  sys_getsockopt
-
-    /*
-     * Wrapper for select() in Linux kernel.
-     */
-    PJ_INLINE(int) select(int n, fd_set *inp, fd_set *outp, fd_set *exp,
-		          struct timeval *tvp)
-    {
-        int count;
-        mm_segment_t oldfs = get_fs();
-        set_fs(KERNEL_DS);
-        count = sys_select(n, inp, outp, exp, tvp);
-        set_fs(oldfs);
-        return count;
-    }
-#endif	/* PJ_LINUX_KERNEL */
-
+//#undef s_addr
+//#undef s6_addr
+//#undef sin_zero
 
 /*
  * This will finally be obsoleted, since it should be declared in

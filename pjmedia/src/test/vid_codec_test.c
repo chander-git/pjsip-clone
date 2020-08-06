@@ -278,8 +278,7 @@ static int encode_decode_test(pj_pool_t *pool, const char *codec_id,
     /* Prepare codec */
     {
         pj_str_t codec_id_st;
-        unsigned info_cnt = 1;
-        const pjmedia_vid_codec_info *codec_info;
+        unsigned info_cnt = 1;        
 
         /* Lookup codec */
         pj_cstr(&codec_id_st, codec_id);
@@ -463,6 +462,20 @@ int vid_codec_test(void)
     }
 #endif
 
+#if PJMEDIA_HAS_VIDEO && PJMEDIA_HAS_VID_TOOLBOX_CODEC
+    status = pjmedia_codec_vid_toolbox_init(NULL, mem);
+    if (status != PJ_SUCCESS) {
+	return -23;
+    }
+#endif
+
+#if PJMEDIA_HAS_VIDEO && PJMEDIA_HAS_VPX_CODEC
+    status = pjmedia_codec_vpx_vid_init(NULL, mem);
+    if (status != PJ_SUCCESS) {
+	return -22;
+    }
+#endif
+
 #if PJMEDIA_HAS_FFMPEG_VID_CODEC
     status = pjmedia_codec_ffmpeg_vid_init(NULL, mem);
     if (status != PJ_SUCCESS)
@@ -483,12 +496,34 @@ int vid_codec_test(void)
 	goto on_return;
 #endif
 
-#if PJMEDIA_HAS_FFMPEG_VID_CODEC || PJMEDIA_HAS_OPENH264_CODEC
+#if PJMEDIA_HAS_FFMPEG_VID_CODEC || PJMEDIA_HAS_OPENH264_CODEC || \
+    PJMEDIA_HAS_VID_TOOLBOX_CODEC
+
     rc = encode_decode_test(pool, "h264", PJMEDIA_VID_PACKING_WHOLE);
     if (rc != 0)
 	goto on_return;
 
     rc = encode_decode_test(pool, "h264", PJMEDIA_VID_PACKING_PACKETS);
+    if (rc != 0)
+	goto on_return;
+#endif
+
+#if PJMEDIA_HAS_VPX_CODEC && PJMEDIA_HAS_VPX_CODEC_VP8
+    rc = encode_decode_test(pool, "vp8", PJMEDIA_VID_PACKING_WHOLE);
+    if (rc != 0)
+	goto on_return;
+
+    rc = encode_decode_test(pool, "vp8", PJMEDIA_VID_PACKING_PACKETS);
+    if (rc != 0)
+	goto on_return;
+#endif
+
+#if PJMEDIA_HAS_VPX_CODEC && PJMEDIA_HAS_VPX_CODEC_VP9
+    rc = encode_decode_test(pool, "vp9", PJMEDIA_VID_PACKING_WHOLE);
+    if (rc != 0)
+	goto on_return;
+
+    rc = encode_decode_test(pool, "vp9", PJMEDIA_VID_PACKING_PACKETS);
     if (rc != 0)
 	goto on_return;
 #endif
@@ -501,9 +536,18 @@ on_return:
 #if defined(PJMEDIA_HAS_OPENH264_CODEC) && PJMEDIA_HAS_OPENH264_CODEC != 0
     pjmedia_codec_openh264_vid_deinit();
 #endif
+#if PJMEDIA_HAS_VIDEO && PJMEDIA_HAS_VID_TOOLBOX_CODEC
+    pjmedia_codec_vid_toolbox_deinit();
+#endif
+#if defined(PJMEDIA_HAS_VPX_CODEC) && PJMEDIA_HAS_VPX_CODEC != 0
+    pjmedia_codec_vpx_vid_deinit();
+#endif
     pjmedia_vid_dev_subsys_shutdown();
     pj_pool_release(pool);
     pj_log_set_level(orig_log_level);
+
+    /* Avoid compile warning */
+    PJ_UNUSED_ARG(encode_decode_test);
 
     return rc;
 }

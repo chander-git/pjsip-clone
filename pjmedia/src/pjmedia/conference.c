@@ -75,16 +75,20 @@ static FILE *fhnd_rec;
  * signal level of the ports, so that sudden change in signal level
  * in the port does not cause misaligned signal (which causes noise).
  */
-#define ATTACK_A    (conf->clock_rate / conf->samples_per_frame)
-#define ATTACK_B    1
-#define DECAY_A	    0
-#define DECAY_B	    1
+#if defined(PJMEDIA_CONF_USE_AGC) && PJMEDIA_CONF_USE_AGC != 0
+#   define ATTACK_A     ((conf->clock_rate / conf->samples_per_frame) >> 4)
+#   define ATTACK_B	1
+#   define DECAY_A	0
+#   define DECAY_B	1
 
-#define SIMPLE_AGC(last, target) \
+#   define SIMPLE_AGC(last, target) \
     if (target >= last) \
 	target = (ATTACK_A*(last+1)+ATTACK_B*target)/(ATTACK_A+ATTACK_B); \
     else \
 	target = (DECAY_A*last+DECAY_B*target)/(DECAY_A+DECAY_B)
+#else
+#   define SIMPLE_AGC(last, target)
+#endif
 
 #define MAX_LEVEL   (32767)
 #define MIN_LEVEL   (-32768)
@@ -113,6 +117,9 @@ struct conf_port
     pjmedia_port_op	 tx_setting;	/**< Can we transmit to this port   */
     unsigned		 listener_cnt;	/**< Number of listeners.	    */
     SLOT_TYPE		*listener_slots;/**< Array of listeners.	    */
+    unsigned		*listener_adj_level;
+    					/**< Array of listeners' level
+    					     adjustment.  		    */
     unsigned		 transmitter_cnt;/**<Number of transmitters.	    */
 
     /* Shortcut for port info. */
@@ -129,6 +136,7 @@ struct conf_port
      */
     unsigned		 tx_adj_level;	/**< Adjustment for TX.		    */
     unsigned		 rx_adj_level;	/**< Adjustment for RX.		    */
+    pj_int16_t		*adj_level_buf;	/**< The adjustment buffer.	    */
 
     /* Resample, for converting clock rate, if they're different. */
     pjmedia_resample	*rx_resample;
@@ -243,10 +251,13 @@ static pj_status_t put_frame(pjmedia_port *this_port,
 			     pjmedia_frame *frame);
 static pj_status_t get_frame(pjmedia_port *this_port, 
 			     pjmedia_frame *frame);
+static pj_status_t destroy_port(pjmedia_port *this_port);
+
+#if !DEPRECATED_FOR_TICKET_2234
 static pj_status_t get_frame_pasv(pjmedia_port *this_port, 
 				  pjmedia_frame *frame);
-static pj_status_t destroy_port(pjmedia_port *this_port);
 static pj_status_t destroy_port_pasv(pjmedia_port *this_port);
+#endif
 
 
 /*
@@ -277,10 +288,14 @@ static pj_status_t create_conf_port( pj_pool_t *pool,
     conf_port->rx_adj_level = NORMAL_LEVEL;
 
     /* Create transmit flag array */
-    conf_port->listener_slots = (SLOT_TYPE*)
-				pj_pool_zalloc(pool, 
-					  conf->max_ports * sizeof(SLOT_TYPE));
+    conf_port->listener_slots = (SLOT_TYPE*) pj_pool_zalloc(pool, 
+				          conf->max_ports * sizeof(SLOT_TYPE));
     PJ_ASSERT_RETURN(conf_port->listener_slots, PJ_ENOMEM);
+
+    /* Create adjustment level array */
+    conf_port->listener_adj_level = (unsigned *) pj_pool_zalloc(pool, 
+				       conf->max_ports * sizeof(unsigned));
+    PJ_ASSERT_RETURN(conf_port->listener_adj_level, PJ_ENOMEM);
 
     /* Save some port's infos, for convenience. */
     if (port) {
@@ -297,6 +312,10 @@ static pj_status_t create_conf_port( pj_pool_t *pool,
 	conf_port->samples_per_frame = conf->samples_per_frame;
 	conf_port->channel_count = conf->channel_count;
     }
+
+    /* Create adjustment level buffer. */
+    conf_port->adj_level_buf = (pj_int16_t*) pj_pool_zalloc(pool, 
+			       conf->samples_per_frame * sizeof(pj_int16_t));
 
     /* If port's clock rate is different than conference's clock rate,
      * create a resample sessions.
@@ -651,6 +670,15 @@ PJ_DEF(pj_status_t) pjmedia_conf_destroy( pjmedia_conf *conf )
 	    continue;
 	
 	++ci;
+
+	if (cport->rx_resample) {
+	    pjmedia_resample_destroy(cport->rx_resample);
+	    cport->rx_resample = NULL;
+	}
+	if (cport->tx_resample) {
+	    pjmedia_resample_destroy(cport->tx_resample);
+	    cport->tx_resample = NULL;
+	}
 	if (cport->delay_buf) {
 	    pjmedia_delay_buf_destroy(cport->delay_buf);
 	    cport->delay_buf = NULL;
@@ -674,6 +702,7 @@ static pj_status_t destroy_port(pjmedia_port *this_port)
     return pjmedia_conf_destroy(conf);
 }
 
+#if !DEPRECATED_FOR_TICKET_2234
 static pj_status_t destroy_port_pasv(pjmedia_port *this_port) {
     pjmedia_conf *conf = (pjmedia_conf*) this_port->port_data.pdata;
     struct conf_port *port = conf->ports[this_port->port_data.ldata];
@@ -685,6 +714,7 @@ static pj_status_t destroy_port_pasv(pjmedia_port *this_port) {
 
     return status;
 }
+#endif
 
 /*
  * Get port zero interface.
@@ -798,6 +828,7 @@ PJ_DEF(pj_status_t) pjmedia_conf_add_port( pjmedia_conf *conf,
 }
 
 
+#if !DEPRECATED_FOR_TICKET_2234
 /*
  * Add passive port.
  */
@@ -899,6 +930,7 @@ PJ_DEF(pj_status_t) pjmedia_conf_add_passive_port( pjmedia_conf *conf,
 
     return PJ_SUCCESS;
 }
+#endif
 
 
 
@@ -944,7 +976,7 @@ PJ_DEF(pj_status_t) pjmedia_conf_configure_port( pjmedia_conf *conf,
 PJ_DEF(pj_status_t) pjmedia_conf_connect_port( pjmedia_conf *conf,
 					       unsigned src_slot,
 					       unsigned sink_slot,
-					       int level )
+					       int adj_level )
 {
     struct conf_port *src_port, *dst_port;
     pj_bool_t start_sound = PJ_FALSE;
@@ -954,8 +986,11 @@ PJ_DEF(pj_status_t) pjmedia_conf_connect_port( pjmedia_conf *conf,
     PJ_ASSERT_RETURN(conf && src_slot<conf->max_ports && 
 		     sink_slot<conf->max_ports, PJ_EINVAL);
 
-    /* For now, level MUST be zero. */
-    PJ_ASSERT_RETURN(level == 0, PJ_EINVAL);
+    /* Value must be from -128 to +127 */
+    /* Disabled, you can put more than +127, at your own risk:
+     PJ_ASSERT_RETURN(adj_level >= -128 && adj_level <= 127, PJ_EINVAL);
+     */
+    PJ_ASSERT_RETURN(adj_level >= -128, PJ_EINVAL);
 
     pj_mutex_lock(conf->mutex);
 
@@ -975,6 +1010,9 @@ PJ_DEF(pj_status_t) pjmedia_conf_connect_port( pjmedia_conf *conf,
 
     if (i == src_port->listener_cnt) {
 	src_port->listener_slots[src_port->listener_cnt] = sink_slot;
+	/* Set normalized adjustment level. */
+	src_port->listener_adj_level[src_port->listener_cnt] = adj_level +
+						      	       NORMAL_LEVEL;
 	++conf->connect_cnt;
 	++src_port->listener_cnt;
 	++dst_port->transmitter_cnt;
@@ -1040,6 +1078,8 @@ PJ_DEF(pj_status_t) pjmedia_conf_disconnect_port( pjmedia_conf *conf,
 		  dst_port->transmitter_cnt < conf->max_ports);
 	pj_array_erase(src_port->listener_slots, sizeof(SLOT_TYPE), 
 		       src_port->listener_cnt, i);
+        pj_array_erase(src_port->listener_adj_level, sizeof(unsigned),
+                       src_port->listener_cnt, i);
 	--conf->connect_cnt;
 	--src_port->listener_cnt;
 	--dst_port->transmitter_cnt;
@@ -1151,10 +1191,23 @@ PJ_DEF(pj_status_t) pjmedia_conf_remove_port( pjmedia_conf *conf,
 	--conf->connect_cnt;
     }
 
+    /* Destroy resample if this conf port has it. */
+    if (conf_port->rx_resample) {
+	pjmedia_resample_destroy(conf_port->rx_resample);
+	conf_port->rx_resample = NULL;
+    }
+    if (conf_port->tx_resample) {
+	pjmedia_resample_destroy(conf_port->tx_resample);
+	conf_port->tx_resample = NULL;
+    }
+
     /* Destroy pjmedia port if this conf port is passive port,
      * i.e: has delay buf.
      */
     if (conf_port->delay_buf) {
+	pjmedia_delay_buf_destroy(conf_port->delay_buf);
+	conf_port->delay_buf = NULL;
+
 	pjmedia_port_destroy(conf_port->port);
 	conf_port->port = NULL;
     }
@@ -1227,6 +1280,12 @@ PJ_DEF(pj_status_t) pjmedia_conf_get_port_info( pjmedia_conf *conf,
 
     info->slot = slot;
     info->name = conf_port->name;
+    if (conf_port->port) {
+        pjmedia_format_copy(&info->format, &conf_port->port->info.fmt);
+    } else {
+        pj_bzero(&info->format, sizeof(info->format));
+        info->format.id = PJMEDIA_FORMAT_INVALID;
+    }
     info->tx_setting = conf_port->tx_setting;
     info->rx_setting = conf_port->rx_setting;
     info->listener_cnt = conf_port->listener_cnt;
@@ -1382,6 +1441,55 @@ PJ_DEF(pj_status_t) pjmedia_conf_adjust_tx_level( pjmedia_conf *conf,
     /* Unlock mutex */
     pj_mutex_unlock(conf->mutex);
 
+    return PJ_SUCCESS;
+}
+
+/*
+ * Adjust level of individual connection.
+ */
+PJ_DEF(pj_status_t) pjmedia_conf_adjust_conn_level( pjmedia_conf *conf,
+						    unsigned src_slot,
+						    unsigned sink_slot,
+						    int adj_level )
+{
+    struct conf_port *src_port, *dst_port;
+    unsigned i;
+
+    /* Check arguments */
+    PJ_ASSERT_RETURN(conf && src_slot<conf->max_ports &&
+		     sink_slot<conf->max_ports, PJ_EINVAL);
+
+    /* Value must be from -128 to +127 */
+    /* Disabled, you can put more than +127, at your own risk:
+     PJ_ASSERT_RETURN(adj_level >= -128 && adj_level <= 127, PJ_EINVAL);
+     */
+    PJ_ASSERT_RETURN(adj_level >= -128, PJ_EINVAL);
+
+    pj_mutex_lock(conf->mutex);
+
+    /* Ports must be valid. */
+    src_port = conf->ports[src_slot];
+    dst_port = conf->ports[sink_slot];
+    if (!src_port || !dst_port) {
+	pj_mutex_unlock(conf->mutex);
+	return PJ_EINVAL;
+    }
+
+    /* Check if connection has been made */
+    for (i=0; i<src_port->listener_cnt; ++i) {
+	if (src_port->listener_slots[i] == sink_slot)
+	    break;
+    }
+
+    if (i == src_port->listener_cnt) {
+	/* connection hasn't been made */
+	pj_mutex_unlock(conf->mutex);
+	return PJ_EINVAL;
+    } 
+    /* Set normalized adjustment level. */
+    src_port->listener_adj_level[i] = adj_level + NORMAL_LEVEL;
+
+    pj_mutex_unlock(conf->mutex);
     return PJ_SUCCESS;
 }
 
@@ -1855,8 +1963,10 @@ static pj_status_t get_frame(pjmedia_port *this_port,
 	
 	    status = pjmedia_delay_buf_get(conf_port->delay_buf,
 				  (pj_int16_t*)frame->buf);
-	    if (status != PJ_SUCCESS)
+	    if (status != PJ_SUCCESS) {
+		conf_port->rx_level = 0;
 		continue;
+	    }		
 
 	} else {
 
@@ -1876,16 +1986,22 @@ static pj_status_t get_frame(pjmedia_port *this_port,
 				     status));
 		conf_port->rx_setting = PJMEDIA_PORT_DISABLE;
 		 */
+		conf_port->rx_level = 0;
 		continue;
 	    }
 
 	    /* Check that the port is not removed when we call get_frame() */
-	    if (conf->ports[i] == NULL)
+	    if (conf->ports[i] == NULL) {
+		conf_port->rx_level = 0;
 		continue;
+	    }
+		
 
 	    /* Ignore if we didn't get any frame */
-	    if (frame_type != PJMEDIA_FRAME_TYPE_AUDIO)
+	    if (frame_type != PJMEDIA_FRAME_TYPE_AUDIO) {
+		conf_port->rx_level = 0;
 		continue;
+	    }		
 	}
 
 	p_in = (pj_int16_t*) frame->buf;
@@ -1940,8 +2056,8 @@ static pj_status_t get_frame(pjmedia_port *this_port,
 	for (cj=0; cj < conf_port->listener_cnt; ++cj) 
 	{
 	    struct conf_port *listener;
-	    pj_int32_t *mix_buf;
-	    unsigned k;
+	    pj_int32_t *mix_buf;	    
+	    pj_int16_t *p_in_conn_leveled;
 
 	    listener = conf->ports[conf_port->listener_slots[cj]];
 
@@ -1951,31 +2067,76 @@ static pj_status_t get_frame(pjmedia_port *this_port,
 
 	    mix_buf = listener->mix_buf;
 
+	    /* apply connection level, if not normal */
+	    if (conf_port->listener_adj_level[cj] != NORMAL_LEVEL) {
+		unsigned k = 0;
+		for (; k < conf->samples_per_frame; ++k) {
+		    /* For the level adjustment, we need to store the sample to
+		     * a temporary 32bit integer value to avoid overflowing the
+		     * 16bit sample storage.
+		     */
+		    pj_int32_t itemp;
+
+		    itemp = p_in[k];
+		    /*itemp = itemp * adj / NORMAL_LEVEL;*/
+		    /* bad code (signed/unsigned badness):
+		     *  itemp = (itemp * conf_port->listsener_adj_level) >> 7;
+		     */
+		    itemp *= conf_port->listener_adj_level[cj];
+		    itemp >>= 7;
+
+		    /* Clip the signal if it's too loud */
+		    if (itemp > MAX_LEVEL) itemp = MAX_LEVEL;
+		    else if (itemp < MIN_LEVEL) itemp = MIN_LEVEL;
+
+		    conf_port->adj_level_buf[k] = (pj_int16_t)itemp;
+		}
+
+		/* take the leveled frame */
+		p_in_conn_leveled = conf_port->adj_level_buf;
+	    } else {
+		/* take the frame as-is */
+		p_in_conn_leveled = p_in;
+	    }
+
 	    if (listener->transmitter_cnt > 1) {
 		/* Mixing signals,
 		 * and calculate appropriate level adjustment if there is
 		 * any overflowed level in the mixed signal.
 		 */
-		for (k=0; k < conf->samples_per_frame; ++k) {
-		    mix_buf[k] += p_in[k];
-		    /* Check if normalization adjustment needed. */
-		    if (IS_OVERFLOW(mix_buf[k])) {
-			/* NORMAL_LEVEL * MAX_LEVEL / mix_buf[k]; */
-			int tmp_adj = (MAX_LEVEL<<7) / mix_buf[k];
-			if (tmp_adj<0) tmp_adj = -tmp_adj;
+		unsigned k, samples_per_frame = conf->samples_per_frame;
+		pj_int32_t mix_buf_min = 0;
+		pj_int32_t mix_buf_max = 0;
 
-			if (tmp_adj<listener->mix_adj)
-			    listener->mix_adj = tmp_adj;
+		for (k = 0; k < samples_per_frame; ++k) {
+		    mix_buf[k] += p_in_conn_leveled[k];
+		    if (mix_buf[k] < mix_buf_min)
+			mix_buf_min = mix_buf[k];
+		    if (mix_buf[k] > mix_buf_max)
+			mix_buf_max = mix_buf[k];
+		}
 
-		    } /* if any overflow in the mixed signals */
-		} /* loop mixing signals */
+		/* Check if normalization adjustment needed. */
+		if (mix_buf_min < MIN_LEVEL || mix_buf_max > MAX_LEVEL) {
+		    int tmp_adj;
+
+		    if (-mix_buf_min > mix_buf_max)
+			mix_buf_max = -mix_buf_min;
+
+		    /* NORMAL_LEVEL * MAX_LEVEL / mix_buf_max; */
+		    tmp_adj = (MAX_LEVEL<<7) / mix_buf_max;
+		    if (tmp_adj < listener->mix_adj)
+			listener->mix_adj = tmp_adj;
+		}
 	    } else {
 		/* Only 1 transmitter:
 		 * just copy the samples to the mix buffer
 		 * no mixing and level adjustment needed
 		 */
-		for (k=0; k<conf->samples_per_frame; ++k) {
-		    mix_buf[k] = p_in[k];
+		unsigned k, samples_per_frame = conf->samples_per_frame;
+
+		for (k = 0; k < samples_per_frame; ++k) {
+		    mix_buf[k] = p_in_conn_leveled[k];
 		}
 	    }
 	} /* loop the listeners of conf port */
@@ -2049,6 +2210,7 @@ static pj_status_t get_frame(pjmedia_port *this_port,
 }
 
 
+#if !DEPRECATED_FOR_TICKET_2234
 /*
  * get_frame() for passive port
  */
@@ -2060,6 +2222,7 @@ static pj_status_t get_frame_pasv(pjmedia_port *this_port,
     PJ_UNUSED_ARG(frame);
     return -1;
 }
+#endif
 
 
 /*

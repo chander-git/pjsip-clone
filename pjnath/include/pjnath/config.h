@@ -220,6 +220,13 @@
 #   define PJ_TURN_KEEP_ALIVE_SEC		    15
 #endif
 
+/**
+ * Maximum number of TCP data connection to peer(s) that a TURN client can
+ * open/accept for each TURN allocation (or TURN control connection).
+ */
+#ifndef PJ_TURN_MAX_TCP_CONN_CNT
+#   define PJ_TURN_MAX_TCP_CONN_CNT		    8
+#endif
 
 /* **************************************************************************
  * ICE CONFIGURATION
@@ -242,6 +249,28 @@
  */
 #ifndef PJ_ICE_ST_MAX_CAND
 #   define PJ_ICE_ST_MAX_CAND			    8
+#endif
+
+
+/**
+ * Maximum number of STUN transports for each ICE stream transport component.
+ * Valid values are 1 - 64.
+ *
+ * Default: 2
+ */
+#ifndef PJ_ICE_MAX_STUN
+#   define PJ_ICE_MAX_STUN			    2
+#endif
+
+
+/**
+ * Maximum number of TURN transports for each ICE stream transport component.
+ * Valid values are 1 - 64.
+ *
+ * Default: 2
+ */
+#ifndef PJ_ICE_MAX_TURN
+#   define PJ_ICE_MAX_TURN			    3
 #endif
 
 
@@ -408,12 +437,23 @@
 
 /**
  * This constant specifies the length of random string generated for ICE
- * ufrag and password.
+ * ufrag.
  *
  * Default: 8 (characters)
  */
 #ifndef PJ_ICE_UFRAG_LEN
 #   define PJ_ICE_UFRAG_LEN			    8
+#endif
+
+
+/**
+ * This constant specifies the length of random string generated for ICE
+ * password.
+ *
+ * Default: 24 (characters)
+ */
+#ifndef PJ_ICE_PWD_LEN
+#   define PJ_ICE_PWD_LEN			    24
 #endif
 
 

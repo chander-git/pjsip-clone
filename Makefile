@@ -113,8 +113,11 @@ pjmedia-test: pjmedia/bin/pjmedia-test-$(TARGET_NAME)
 pjsip-test: pjsip/bin/pjsip-test-$(TARGET_NAME)
 	cd pjsip/build && ../bin/pjsip-test-$(TARGET_NAME)
 
-pjsua-test:
+pjsua-test: cmp_wav
 	cd tests/pjsua && python runall.py
+
+cmp_wav:
+	cd tests/pjsua/tools && make
 
 install:
 	mkdir -p $(DESTDIR)$(libdir)/
@@ -129,19 +132,17 @@ install:
 		sed -e "s!@INCLUDEDIR@!$(includedir)!" | \
 		sed -e "s!@LIBDIR@!$(libdir)!" | \
 		sed -e "s/@PJ_VERSION@/$(PJ_VERSION)/" | \
-		sed -e "s!@PJ_LDLIBS@!!" | \
-		sed -e "s!@PJ_LDXXLIBS@!$(PJ_LDXXLIBS)!" | \
-		sed -e "s!@PJ_INSTALL_CFLAGS@!!" | \
-		sed -e "s!@PJ_INSTALL_CXXFLAGS@!$(PJ_INSTALL_CXXFLAGS)!" > $(DESTDIR)/$(libdir)/pkgconfig/libpjproject.pc
+		sed -e "s!@PJ_INSTALL_LDFLAGS@!$(PJ_INSTALL_LDFLAGS)!" | \
+		sed -e "s!@PJ_INSTALL_CFLAGS@!$(PJ_INSTALL_CFLAGS)!" > $(DESTDIR)/$(libdir)/pkgconfig/libpjproject.pc
 
 uninstall:
 	$(RM) $(DESTDIR)$(libdir)/pkgconfig/libpjproject.pc
-	-rmdir $(DESTDIR)$(libdir)/pkgconfig 2> /dev/null
+	rmdir $(DESTDIR)$(libdir)/pkgconfig 2> /dev/null || true
 	for d in pjlib pjlib-util pjnath pjmedia pjsip; do \
 		for f in $$d/include/*; do \
 			$(RM) -r "$(DESTDIR)$(includedir)/`basename $$f`"; \
 		done; \
 	done
-	-rmdir $(DESTDIR)$(includedir) 2> /dev/null
+	rmdir $(DESTDIR)$(includedir) 2> /dev/null || true
 	$(RM) $(addprefix $(DESTDIR)$(libdir)/,$(notdir $(APP_LIB_FILES)))
-	-rmdir $(DESTDIR)$(libdir) 2> /dev/null
+	rmdir $(DESTDIR)$(libdir) 2> /dev/null || true

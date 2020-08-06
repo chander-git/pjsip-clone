@@ -48,6 +48,10 @@
 
 #include <pjlib.h>
 
+#ifdef	_MSC_VER
+#pragma warning(disable:4702) // warning C4702: unreachable code
+#endif
+
 #define	ID_1	1
 #define ID_2	2
 
@@ -164,9 +168,11 @@ static int test(void)
     PJ_CATCH_ANY {
 	switch (PJ_GET_EXCEPTION()) {
 	case ID_1:
-	    if (!rc) rc = -30; break;
+	    if (!rc) rc = -30;
+	    break;
 	case ID_2:
-	    if (!rc) rc = 0; break;
+	    if (!rc) rc = 0;
+	    break;
 	default:
 	    if (!rc) rc = -40;
 	    break;

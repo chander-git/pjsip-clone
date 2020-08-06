@@ -66,6 +66,12 @@
 
 #endif
 
+#define HAS_AUDIO_CODECS (PJMEDIA_HAS_G711_CODEC || PJMEDIA_HAS_G722_CODEC ||\
+	 		  PJMEDIA_HAS_GSM_CODEC || PJMEDIA_HAS_ILBC_CODEC || \
+			  PJMEDIA_HAS_SPEEX_CODEC|| PJMEDIA_HAS_G7221_CODEC||\
+			  PJMEDIA_HAS_OPENCORE_AMRNB_CODEC ||\
+			  PJMEDIA_HAS_OPENCORE_AMRWB_CODEC ||\
+			  PJMEDIA_HAS_L16_CODEC)
 
 
 /* Sample speech data, 360ms length, encoded at 8Khz */
@@ -715,7 +721,7 @@ static pj_status_t codec_put_frame(struct pjmedia_port *this_port,
 	}
     }
 
-    return PJ_SUCCESS;
+    return status;
 }
 
 static pj_status_t codec_on_destroy(struct pjmedia_port *this_port)
@@ -730,6 +736,7 @@ static pj_status_t codec_on_destroy(struct pjmedia_port *this_port)
     return PJ_SUCCESS;
 }
 
+#if HAS_AUDIO_CODECS
 static pjmedia_port* codec_encode_decode( pj_pool_t *pool,
 					  const char *codec,
 					  pj_status_t (*codec_init)(pjmedia_endpt*),
@@ -792,6 +799,7 @@ static pjmedia_port* codec_encode_decode( pj_pool_t *pool,
 
     return &cp->base;
 }
+#endif
 
 #if PJMEDIA_HAS_G711_CODEC
 /* G.711 benchmark */
@@ -1029,7 +1037,7 @@ static pj_status_t wsola_plc_get_frame(struct pjmedia_port *this_port,
 	wp->prev_lost = PJ_TRUE;
     }
 
-    return PJ_SUCCESS;
+    return status;
 }
 
 static pj_status_t wsola_plc_on_destroy(struct pjmedia_port *this_port)
@@ -1172,7 +1180,7 @@ static pj_status_t wsola_discard_get_frame(struct pjmedia_port *this_port,
 					   pjmedia_frame *frame)
 {
     struct wsola_discard_port *wp = (struct wsola_discard_port*)this_port;
-    pj_status_t status;
+    pj_status_t status = PJ_SUCCESS;
 
     while (pjmedia_circ_buf_get_len(wp->circbuf) <
 		PJMEDIA_PIA_SPF(&wp->base.info) * (CIRC_BUF_FRAME_CNT-1))
@@ -1202,7 +1210,7 @@ static pj_status_t wsola_discard_get_frame(struct pjmedia_port *this_port,
 	pj_assert(status==PJ_SUCCESS);
     }
 
-    return PJ_SUCCESS;
+    return status;
 }
 
 static pj_status_t wsola_discard_on_destroy(struct pjmedia_port *this_port)
@@ -1696,6 +1704,7 @@ static void stream_port_custom_deinit(struct test_entry *te)
 
 }
 
+#if HAS_AUDIO_CODECS
 static pjmedia_port* create_stream( pj_pool_t *pool,
 				    const char *codec,
 				    pj_status_t (*codec_init)(pjmedia_endpt*),
@@ -1822,6 +1831,7 @@ static pjmedia_port* create_stream( pj_pool_t *pool,
 
     return port;
 }
+#endif
 
 #if PJMEDIA_HAS_G711_CODEC
 /* G.711 stream, no SRTP */
@@ -2093,7 +2103,7 @@ static pj_status_t delaybuf_get_frame(struct pjmedia_port *this_port,
 	}
     }
 
-    return PJ_SUCCESS;
+    return status;
 }
 
 static pj_status_t delaybuf_put_frame(struct pjmedia_port *this_port, 
@@ -2121,7 +2131,7 @@ static pj_status_t delaybuf_put_frame(struct pjmedia_port *this_port,
 	}
     }
 
-    return PJ_SUCCESS;
+    return status;
 }
 
 static pj_status_t delaybuf_on_destroy(struct pjmedia_port *this_port)
@@ -2365,6 +2375,7 @@ static pj_timestamp run_entry(unsigned clock_rate, struct test_entry *e)
 	    pj_assert(status == PJ_SUCCESS);
 	}
     }
+    PJ_UNUSED_ARG(status);
     pj_get_timestamp(&t1);
 
     pj_sub_timestamp(&t1, &t0);
@@ -2490,7 +2501,7 @@ int mips_test(void)
 #endif
     };
 
-    unsigned i, c, k[3] = {K8, K16, K32}, clock_rates[3] = {8000, 16000, 32000};
+    unsigned i, c, clks[3] = {K8, K16, K32}, clock_rates[3] = {8000, 16000, 32000};
 
     PJ_LOG(3,(THIS_FILE, "MIPS test, with CPU=%dMhz, %6.1f MIPS", CPU_MHZ, CPU_IPS / 1000000));
     PJ_LOG(3,(THIS_FILE, "Clock  Item                                      Time     CPU    MIPS"));
@@ -2509,7 +2520,7 @@ int mips_test(void)
 	    float cpu_pct, mips_val;
 	    unsigned j, clock_rate = clock_rates[c];
 
-	    if ((e->valid_clock_rate & k[c]) == 0)
+	    if ((e->valid_clock_rate & clks[c]) == 0)
 		continue;
 
 	    /* Run test */

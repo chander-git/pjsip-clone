@@ -229,6 +229,7 @@ PJ_DEF(pj_status_t) pjmedia_codec_l16_deinit(void)
     l16_factory.endpt = NULL;
 
     /* Destroy mutex. */
+    pj_mutex_unlock(l16_factory.mutex);
     pj_mutex_destroy(l16_factory.mutex);
     l16_factory.mutex = NULL;
 
@@ -311,6 +312,7 @@ static pj_status_t l16_enum_codecs( pjmedia_codec_factory *factory,
 	++count;
     }
 
+#if PJMEDIA_CODEC_L16_HAS_8KHZ_MONO
     if (count < *max_count) {
 	/* 8KHz mono */
 	codecs[count].type = PJMEDIA_TYPE_AUDIO;
@@ -320,7 +322,9 @@ static pj_status_t l16_enum_codecs( pjmedia_codec_factory *factory,
 	codecs[count].channel_cnt = 1;
 	++count;
     }
+#endif
 
+#if PJMEDIA_CODEC_L16_HAS_8KHZ_STEREO
     if (count < *max_count) {
 	/* 8KHz stereo */
 	codecs[count].type = PJMEDIA_TYPE_AUDIO;
@@ -330,6 +334,7 @@ static pj_status_t l16_enum_codecs( pjmedia_codec_factory *factory,
 	codecs[count].channel_cnt = 2;
 	++count;
     }
+#endif
 
 // disable some L16 modes
 #if 0
@@ -354,6 +359,7 @@ static pj_status_t l16_enum_codecs( pjmedia_codec_factory *factory,
     }
 #endif
 
+#if PJMEDIA_CODEC_L16_HAS_16KHZ_MONO
     if (count < *max_count) {
 	/* 16000 Hz mono */
 	codecs[count].type = PJMEDIA_TYPE_AUDIO;
@@ -363,8 +369,9 @@ static pj_status_t l16_enum_codecs( pjmedia_codec_factory *factory,
 	codecs[count].channel_cnt = 1;
 	++count;
     }
+#endif
 
-
+#if PJMEDIA_CODEC_L16_HAS_16KHZ_STEREO
     if (count < *max_count) {
 	/* 16000 Hz stereo */
 	codecs[count].type = PJMEDIA_TYPE_AUDIO;
@@ -374,6 +381,7 @@ static pj_status_t l16_enum_codecs( pjmedia_codec_factory *factory,
 	codecs[count].channel_cnt = 2;
 	++count;
     }
+#endif
 
 // disable some L16 modes
 #if 0
@@ -417,7 +425,9 @@ static pj_status_t l16_enum_codecs( pjmedia_codec_factory *factory,
 	codecs[count].channel_cnt = 2;
 	++count;
     }
+#endif
 
+#if PJMEDIA_CODEC_L16_HAS_48KHZ_MONO
     if (count < *max_count) {
 	/* 48KHz mono */
 	codecs[count].type = PJMEDIA_TYPE_AUDIO;
@@ -427,7 +437,9 @@ static pj_status_t l16_enum_codecs( pjmedia_codec_factory *factory,
 	codecs[count].channel_cnt = 1;
 	++count;
     }
+#endif
 
+#if PJMEDIA_CODEC_L16_HAS_48KHZ_STEREO
     if (count < *max_count) {
 	/* 48KHz stereo */
 	codecs[count].type = PJMEDIA_TYPE_AUDIO;
@@ -590,7 +602,7 @@ static pj_status_t  l16_parse( pjmedia_codec *codec,
 	frames[count].type = PJMEDIA_FRAME_TYPE_AUDIO;
 	frames[count].buf = pkt;
 	frames[count].size = data->frame_size;
-	frames[count].timestamp.u64 = ts->u64 + (count * data->frame_size);
+	frames[count].timestamp.u64 = ts->u64 + (count * data->frame_size >> 1);
 
 	pkt = ((char*)pkt) + data->frame_size;
 	pkt_size -= data->frame_size;

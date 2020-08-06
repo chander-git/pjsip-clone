@@ -272,13 +272,14 @@ int main(int argc, char *argv[])
      */
     {
 	pj_sockaddr addr;
+	int af = AF;
 
-	pj_sockaddr_init(AF, &addr, NULL, (pj_uint16_t)SIP_PORT);
+	pj_sockaddr_init(af, &addr, NULL, (pj_uint16_t)SIP_PORT);
 	
-	if (AF == pj_AF_INET()) {
+	if (af == pj_AF_INET()) {
 	    status = pjsip_udp_transport_start( g_endpt, &addr.ipv4, NULL, 
 						1, NULL);
-	} else if (AF == pj_AF_INET6()) {
+	} else if (af == pj_AF_INET6()) {
 	    status = pjsip_udp_transport_start6(g_endpt, &addr.ipv6, NULL,
 						1, NULL);
 	} else {
@@ -364,6 +365,9 @@ int main(int argc, char *argv[])
 #endif
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
 
+    /* Create pool. */
+    pool = pjmedia_endpt_create_pool(g_med_endpt, "Media pool", 512, 512);	
+
     /* 
      * Add PCMA/PCMU codec to the media endpoint. 
      */
@@ -375,7 +379,6 @@ int main(int argc, char *argv[])
 
 #if defined(PJMEDIA_HAS_VIDEO) && (PJMEDIA_HAS_VIDEO != 0)
     /* Init video subsystem */
-    pool = pjmedia_endpt_create_pool(g_med_endpt, "Video subsystem", 512, 512);
     status = pjmedia_video_format_mgr_create(pool, 64, 0, NULL);
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
     status = pjmedia_converter_mgr_create(pool, NULL);
@@ -385,8 +388,18 @@ int main(int argc, char *argv[])
     status = pjmedia_vid_dev_subsys_init(&cp.factory);
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
 
+#if PJMEDIA_HAS_VIDEO && PJMEDIA_HAS_VID_TOOLBOX_CODEC
+    status = pjmedia_codec_vid_toolbox_init(NULL, &cp.factory);
+    PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
+#endif
+
 #   if defined(PJMEDIA_HAS_OPENH264_CODEC) && PJMEDIA_HAS_OPENH264_CODEC != 0
     status = pjmedia_codec_openh264_vid_init(NULL, &cp.factory);
+    PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
+#   endif
+
+#   if defined(PJMEDIA_HAS_VPX_CODEC) && PJMEDIA_HAS_VPX_CODEC != 0
+    status = pjmedia_codec_vpx_vid_init(NULL, &cp.factory);
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
 #   endif
 
@@ -398,6 +411,10 @@ int main(int argc, char *argv[])
 
 #endif	/* PJMEDIA_HAS_VIDEO */
     
+    /* Create event manager */
+    status = pjmedia_event_mgr_create(pool, 0, NULL);
+    PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
+
     /* 
      * Create media transport used to send/receive RTP/RTCP socket.
      * One media transport is needed for each call. Application may
@@ -584,6 +601,12 @@ int main(int argc, char *argv[])
 #   if defined(PJMEDIA_HAS_OPENH264_CODEC) && PJMEDIA_HAS_OPENH264_CODEC != 0
     pjmedia_codec_openh264_vid_deinit();
 #   endif
+#   if PJMEDIA_HAS_VIDEO && PJMEDIA_HAS_VID_TOOLBOX_CODEC
+    pjmedia_codec_vid_toolbox_deinit();
+#   endif
+#   if defined(PJMEDIA_HAS_VPX_CODEC) && PJMEDIA_HAS_VPX_CODEC != 0
+    pjmedia_codec_vpx_vid_deinit();
+#   endif
 
 #endif
 
@@ -592,6 +615,9 @@ int main(int argc, char *argv[])
 	if (g_med_transport[i])
 	    pjmedia_transport_close(g_med_transport[i]);
     }
+
+    /* Destroy event manager */
+    pjmedia_event_mgr_destroy(NULL); 
 
     /* Deinit pjmedia endpoint */
     if (g_med_endpt)
@@ -725,10 +751,10 @@ static pj_bool_t on_rx_request( pjsip_rx_data *rdata )
     /*
      * Create UAS dialog.
      */
-    status = pjsip_dlg_create_uas( pjsip_ua_instance(), 
-				   rdata,
-				   &local_uri, /* contact */
-				   &dlg);
+    status = pjsip_dlg_create_uas_and_inc_lock( pjsip_ua_instance(),
+						rdata,
+						&local_uri, /* contact */
+						&dlg);
     if (status != PJ_SUCCESS) {
 	pjsip_endpt_respond_stateless(g_endpt, rdata, 500, NULL,
 				      NULL, NULL);
@@ -741,7 +767,11 @@ static pj_bool_t on_rx_request( pjsip_rx_data *rdata )
 
     status = pjmedia_endpt_create_sdp( g_med_endpt, rdata->tp_info.pool,
 				       MAX_MEDIA_CNT, g_sock_info, &local_sdp);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, PJ_TRUE);
+    pj_assert(status == PJ_SUCCESS);
+    if (status != PJ_SUCCESS) {
+	pjsip_dlg_dec_lock(dlg);
+	return PJ_TRUE;
+    }
 
 
     /* 
@@ -749,7 +779,16 @@ static pj_bool_t on_rx_request( pjsip_rx_data *rdata )
      * capability to the session.
      */
     status = pjsip_inv_create_uas( dlg, rdata, local_sdp, 0, &g_inv);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, PJ_TRUE);
+    pj_assert(status == PJ_SUCCESS);
+    if (status != PJ_SUCCESS) {
+	pjsip_dlg_dec_lock(dlg);
+	return PJ_TRUE;
+    }
+
+    /*
+     * Invite session has been created, decrement & release dialog lock.
+     */
+    pjsip_dlg_dec_lock(dlg);
 
 
     /*
@@ -857,6 +896,9 @@ static void call_on_media_update( pjsip_inv_session *inv,
 	return;
     }
 
+    /* Start the UDP media transport */
+    pjmedia_transport_media_start(g_med_transport[0], 0, 0, 0, 0);
+
     /* Get the media port interface of the audio stream. 
      * Media port interface is basicly a struct containing get_frame() and
      * put_frame() function. With this media port interface, we can attach
@@ -932,6 +974,9 @@ static void call_on_media_update( pjsip_inv_session *inv,
 	    app_perror( THIS_FILE, "Unable to start video stream", status);
 	    return;
 	}
+
+	/* Start the UDP media transport */
+	pjmedia_transport_media_start(g_med_transport[1], 0, 0, 0, 0);
 
 	if (vstream_info.dir & PJMEDIA_DIR_DECODING) {
 	    status = pjmedia_vid_dev_default_param(

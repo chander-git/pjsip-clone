@@ -25,12 +25,36 @@
 #include <pj/log.h>
 #include <pj/pool.h>
 
-
 #if defined(PJMEDIA_HAS_VIDEO) && (PJMEDIA_HAS_VIDEO != 0)
 
 
 #define SIGNATURE	PJMEDIA_SIG_VID_PORT
 #define THIS_FILE	"vid_port.c"
+
+
+/* Enable/disable test of finding closest format algo */
+#define ENABLE_TEST_FIND_FMT 0
+
+
+/**
+ * Enable this to trace the format matching process.
+ */
+#if 0
+#  define TRACE_FIND_FMT(args)	    PJ_LOG(5,args)
+#else
+#  define TRACE_FIND_FMT(args)
+#endif
+
+/**
+ * We use nearest width and aspect ratio to find match between the requested 
+ * format and the supported format. Specify this to determine the array size 
+ * of the supported formats with the nearest width. From this array, we will 
+ * find the one with lowest diff_ratio. Setting this to 1 will thus skip 
+ * the aspect ratio calculation. 
+ */
+#ifndef PJMEDIA_VID_PORT_MATCH_WIDTH_ARRAY_SIZE
+#   define PJMEDIA_VID_PORT_MATCH_WIDTH_ARRAY_SIZE 3
+#endif
 
 typedef struct vid_pasv_port vid_pasv_port;
 
@@ -39,6 +63,13 @@ enum role
     ROLE_NONE,
     ROLE_ACTIVE,
     ROLE_PASSIVE
+};
+
+enum fmt_match
+{
+    FMT_MATCH,
+    FMT_SAME_COLOR_SPACE,
+    FMT_DIFF_COLOR_SPACE
 };
 
 struct pjmedia_vid_port
@@ -88,6 +119,13 @@ struct vid_pasv_port
     pjmedia_vid_port	*vp;
 };
 
+struct fmt_prop 
+{
+    pj_uint32_t id;
+    pjmedia_rect_size size;
+    pjmedia_ratio fps;
+};
+
 static pj_status_t vidstream_cap_cb(pjmedia_vid_dev_stream *stream,
 				    void *user_data,
 				    pjmedia_frame *frame);
@@ -127,6 +165,23 @@ static const char *vid_dir_name(pjmedia_dir dir)
     }
 }
 
+static pj_status_t get_vfi(const pjmedia_format *fmt,
+			   const pjmedia_video_format_info **p_vfi,
+			   pjmedia_video_apply_fmt_param *vafp)
+{
+    const pjmedia_video_format_info *vfi;
+
+    vfi = pjmedia_get_video_format_info(NULL, fmt->id);
+    if (!vfi)
+	return PJMEDIA_EBADFMT;
+
+    if (p_vfi) *p_vfi = vfi;
+
+    pj_bzero(vafp, sizeof(*vafp));
+    vafp->size = fmt->det.vid.size;
+    return vfi->apply_fmt(vfi, vafp);
+}
+
 static pj_status_t create_converter(pjmedia_vid_port *vp)
 {
     if (vp->conv.conv) {
@@ -156,19 +211,12 @@ static pj_status_t create_converter(pjmedia_vid_port *vp)
         (vp->role==ROLE_ACTIVE && (vp->dir & PJMEDIA_DIR_ENCODING)))
     {
 	pj_status_t status;
-	const pjmedia_video_format_info *vfi;
 	pjmedia_video_apply_fmt_param vafp;
 
 	/* Allocate buffer for conversion */
-	vfi = pjmedia_get_video_format_info(NULL, vp->conv.conv_param.dst.id);
-	if (!vfi)
-	    return PJMEDIA_EBADFMT;
-
-	pj_bzero(&vafp, sizeof(vafp));
-	vafp.size = vp->conv.conv_param.dst.det.vid.size;
-	status = vfi->apply_fmt(vfi, &vafp);
+	status = get_vfi(&vp->conv.conv_param.dst, NULL, &vafp);
 	if (status != PJ_SUCCESS)
-	    return PJMEDIA_EBADFMT;
+	    return status;
 
 	if (vafp.framebytes > vp->conv.conv_buf_size) {
 	    vp->conv.conv_buf = pj_pool_alloc(vp->pool, vafp.framebytes);
@@ -181,15 +229,269 @@ static pj_status_t create_converter(pjmedia_vid_port *vp)
     vp->conv.usec_dst = PJMEDIA_PTIME(&vp->conv.conv_param.dst.det.vid.fps);
 
     return PJ_SUCCESS;
+}	  
+
+static pj_uint32_t match_format_id(pj_uint32_t req_id,
+				   pj_uint32_t sup_id)
+{
+    const pjmedia_video_format_info *req_fmt_info, *sup_fmt_info;
+
+    if (req_id == sup_id)
+	return FMT_MATCH;
+
+    req_fmt_info = pjmedia_get_video_format_info( 
+					pjmedia_video_format_mgr_instance(),
+					req_id);
+
+    sup_fmt_info = pjmedia_get_video_format_info( 
+					pjmedia_video_format_mgr_instance(),
+					sup_id);
+
+    if ((req_fmt_info == NULL) || (sup_fmt_info == NULL)) {
+	return FMT_DIFF_COLOR_SPACE;
+    }
+
+    if (req_fmt_info->color_model == sup_fmt_info->color_model) {
+	return FMT_SAME_COLOR_SPACE;
+    }
+
+    return FMT_DIFF_COLOR_SPACE;
 }
+
+static pj_uint32_t get_match_format_id(pj_uint32_t req_fmt_id,
+				       pjmedia_vid_dev_info *di)
+{
+    unsigned i, match_idx = 0, match_fmt = FMT_DIFF_COLOR_SPACE+1;
+
+    /* Find the matching format. If no exact match is found, find 
+     * the supported format with the same color space. If no match is found,
+     * use the first supported format on the list.
+     */
+    for (i = 0; i < di->fmt_cnt; ++i) {
+	unsigned tmp_fmt = match_format_id(req_fmt_id, di->fmt[i].id);
+
+	if (match_fmt == FMT_MATCH)
+	    return req_fmt_id;
+
+	if (tmp_fmt < match_fmt) {
+	    match_idx = i;
+	    match_fmt = tmp_fmt;
+	}
+    }
+    return di->fmt[match_idx].id;
+}
+
+/**
+ * Find the closest supported format from the specific requested format.
+ * The algo is to find a supported size with the matching format id, width and
+ * lowest diff_ratio.
+ * ---
+ * For format id matching, the priority is:
+ * 1. Find exact match
+ * 2. Find format with the same color space
+ * 3. Use the first supported format. 
+ * ---
+ * For ratio matching:
+ * Find the lowest difference of the aspect ratio between the requested and
+ * the supported format.
+ */
+static struct fmt_prop find_closest_fmt(pj_uint32_t req_fmt_id,
+					pjmedia_rect_size *req_fmt_size,
+					pjmedia_ratio *req_fmt_fps,
+					pjmedia_vid_dev_info *di)
+{
+    unsigned i, match_idx = 0;
+    pj_uint32_t match_fmt_id;     
+    float req_ratio, min_diff_ratio = 0.0;    
+    struct fmt_prop ret_prop;
+    pj_bool_t found_exact_match = PJ_FALSE;
+
+    #define	GET_DIFF(x, y)	((x) > (y)? (x-y) : (y-x))
+    
+    /* This will contain the supported format with lowest width difference */
+    pjmedia_rect_size nearest_width[PJMEDIA_VID_PORT_MATCH_WIDTH_ARRAY_SIZE];
+
+    /* Initialize the list. */
+    for (i=0;i<PJMEDIA_VID_PORT_MATCH_WIDTH_ARRAY_SIZE;++i) {
+	nearest_width[i].w = 0xFFFFFFFF;
+	nearest_width[i].h = 0;
+    }
+
+    /* Get the matching format id. We assume each format will support all 
+     * image size. 
+     */
+    match_fmt_id = get_match_format_id(req_fmt_id, di);
+    
+    /* Search from the supported format, the smallest diff width. Stop the 
+     * search if exact match is found.
+     */
+    for (i=0;i<di->fmt_cnt;++i) {
+	pjmedia_video_format_detail *vfd;
+	unsigned diff_width1, diff_width2;
+
+	/* Ignore supported format with different format id. */
+	if (di->fmt[i].id != match_fmt_id)
+	    continue;
+
+	vfd = pjmedia_format_get_video_format_detail(&di->fmt[i], PJ_TRUE);
+
+	/* Exact match found. */
+	if ((vfd->size.w == req_fmt_size->w) && 
+	    (vfd->size.h == req_fmt_size->h)) 
+	{
+	    nearest_width[0] = vfd->size;
+	    found_exact_match = PJ_TRUE;
+	    break;
+	}
+
+	diff_width1 =  GET_DIFF(vfd->size.w, req_fmt_size->w);
+	diff_width2 =  GET_DIFF(nearest_width[0].w, req_fmt_size->w);
+
+	/* Fill the nearest width list. */
+	if (diff_width1 <= diff_width2) {
+	    int k = 1;
+	    pjmedia_rect_size tmp_size = vfd->size;
+
+	    while(((k < PJ_ARRAY_SIZE(nearest_width)) &&
+		   (GET_DIFF(tmp_size.w, req_fmt_size->w) <
+		   (GET_DIFF(nearest_width[k].w, req_fmt_size->w)))))
+	    {
+		nearest_width[k-1] = nearest_width[k];
+		++k;
+	    }
+	    nearest_width[k-1] = tmp_size;
+	}
+    }
+    /* No need to calculate ratio if exact match is found. */
+    if (!found_exact_match) {
+	pj_bool_t found_match = PJ_FALSE;
+
+	/* We have the list of supported format with nearest width. Now get the 
+	 * best ratio.
+	 */
+	req_ratio = (float)req_fmt_size->w / (float)req_fmt_size->h;
+	for (i=0;i<PJ_ARRAY_SIZE(nearest_width);++i) {
+	    float sup_ratio, diff_ratio;
+
+	    if (nearest_width[i].w == 0xFFFFFFFF)
+		continue;
+
+	    sup_ratio = (float)nearest_width[i].w / (float)nearest_width[i].h;
+
+	    diff_ratio = GET_DIFF(sup_ratio, req_ratio);
+
+	    if ((!found_match) || (diff_ratio <= min_diff_ratio)) {
+		found_match = PJ_TRUE;
+		match_idx = i;
+		min_diff_ratio = diff_ratio;
+	    }
+	}
+    }
+    ret_prop.id = match_fmt_id;
+    ret_prop.size = nearest_width[match_idx];
+    ret_prop.fps = *req_fmt_fps;
+    return ret_prop;
+}
+
+#if ENABLE_TEST_FIND_FMT
+/**
+ * This is to test the algo to find the closest fmt
+ */
+static void test_find_closest_fmt(pjmedia_vid_dev_info *di)
+{  
+    unsigned i, j, k;
+    char fmt_name[5];
+
+    pjmedia_rect_size find_size[] = {
+	{720, 480},
+	{352, 288},
+	{400, 300},
+	{1600, 900},
+	{255, 352},
+	{500, 500},
+    };
+
+    pjmedia_ratio find_fps[] = {
+	{1, 1},
+	{10, 1},
+	{15, 1},
+	{30, 1},
+    };
+
+    pj_uint32_t find_id[] = {
+	PJMEDIA_FORMAT_RGB24,
+	PJMEDIA_FORMAT_RGBA,
+	PJMEDIA_FORMAT_AYUV,
+	PJMEDIA_FORMAT_YUY2,
+	PJMEDIA_FORMAT_I420
+    };
+
+    TRACE_FIND_FMT((THIS_FILE, "Supported format = "));
+    for (i = 0; i < di->fmt_cnt; i++) {
+	//pjmedia_video_format_detail *vid_fd = 
+	//    pjmedia_format_get_video_format_detail(&di->fmt[i], PJ_TRUE);
+
+	pjmedia_fourcc_name(di->fmt[i].id, fmt_name);
+
+	TRACE_FIND_FMT((THIS_FILE, "id:%s size:%d*%d fps:%d/%d", 
+			fmt_name,
+			vid_fd->size.w,
+			vid_fd->size.h,
+			vid_fd->fps.num,
+			vid_fd->fps.denum));
+    }
+    
+    for (i = 0; i < PJ_ARRAY_SIZE(find_id); i++) {
+
+	for (j = 0; j < PJ_ARRAY_SIZE(find_fps); j++) {
+	
+	    for (k = 0; k < PJ_ARRAY_SIZE(find_size); k++) {
+		struct fmt_prop match_prop;
+
+		pjmedia_fourcc_name(find_id[i], fmt_name);
+
+		TRACE_FIND_FMT((THIS_FILE, "Trying to find closest match "
+				           "id:%s size:%dx%d fps:%d/%d", 
+			        fmt_name,
+			        find_size[k].w,
+			        find_size[k].h,
+			        find_fps[j].num,
+			        find_fps[j].denum));
+		
+		match_prop = find_closest_fmt(find_id[i],
+					      &find_size[k],
+					      &find_fps[j],
+					      di);
+
+		if ((match_prop.id == find_id[i]) && 
+		    (match_prop.size.w == find_size[k].w) &&
+		    (match_prop.size.h == find_size[k].h) &&
+		    (match_prop.fps.num / match_prop.fps.denum == 
+		     find_fps[j].num * find_fps[j].denum)) 
+		{
+		    TRACE_FIND_FMT((THIS_FILE, "Exact Match found!!"));
+		} else {
+		    pjmedia_fourcc_name(match_prop.id, fmt_name);
+		    TRACE_FIND_FMT((THIS_FILE, "Closest format = "\
+					        "id:%s size:%dx%d fps:%d/%d", 
+				    fmt_name,
+				    match_prop.size.w,
+				    match_prop.size.h, 
+				    match_prop.fps.num,
+				    match_prop.fps.denum));		    
+		}
+	    }
+	}
+    }
+}
+#endif
 
 PJ_DEF(pj_status_t) pjmedia_vid_port_create( pj_pool_t *pool,
 					     const pjmedia_vid_port_param *prm,
 					     pjmedia_vid_port **p_vid_port)
 {
     pjmedia_vid_port *vp;
-    const pjmedia_video_format_detail *vfd;
-    char dev_name[64];
+    pjmedia_video_format_detail *vfd;
     char fmt_name[5];
     pjmedia_vid_dev_cb vid_cb;
     pj_bool_t need_frame_buf = PJ_FALSE;
@@ -197,7 +499,7 @@ PJ_DEF(pj_status_t) pjmedia_vid_port_create( pj_pool_t *pool,
     unsigned ptime_usec;
     pjmedia_vid_dev_param vparam;
     pjmedia_vid_dev_info di;
-    unsigned i;
+    char dev_name[sizeof(di.name) + sizeof(di.driver) + 4];
 
     PJ_ASSERT_RETURN(pool && prm && p_vid_port, PJ_EINVAL);
     PJ_ASSERT_RETURN(prm->vidparam.fmt.type == PJMEDIA_TYPE_VIDEO &&
@@ -212,6 +514,14 @@ PJ_DEF(pj_status_t) pjmedia_vid_port_create( pj_pool_t *pool,
 
     PJ_ASSERT_RETURN(vfd->fps.num, PJ_EINVAL);
 
+    /* Get device info */
+    if (prm->vidparam.dir & PJMEDIA_DIR_CAPTURE)
+        status = pjmedia_vid_dev_get_info(prm->vidparam.cap_id, &di);
+    else
+        status = pjmedia_vid_dev_get_info(prm->vidparam.rend_id, &di);
+    if (status != PJ_SUCCESS)
+        return status;
+
     /* Allocate videoport */
     vp = PJ_POOL_ZALLOC_T(pool, pjmedia_vid_port);
     vp->pool = pj_pool_create(pool->factory, "video port", 500, 500, NULL);
@@ -222,42 +532,51 @@ PJ_DEF(pj_status_t) pjmedia_vid_port_create( pj_pool_t *pool,
     vparam = prm->vidparam;
     dev_name[0] = '\0';
 
-    /* Get device info */
-    if (vp->dir & PJMEDIA_DIR_CAPTURE)
-        status = pjmedia_vid_dev_get_info(prm->vidparam.cap_id, &di);
-    else
-        status = pjmedia_vid_dev_get_info(prm->vidparam.rend_id, &di);
-    if (status != PJ_SUCCESS)
-        return status;
-
-    pj_ansi_snprintf(dev_name, sizeof(dev_name), "%s [%s]",
-                     di.name, di.driver);
-
-    for (i = 0; i < di.fmt_cnt; ++i) {
-        if (prm->vidparam.fmt.id == di.fmt[i].id)
-            break;
-    }
-
-    if (i == di.fmt_cnt) {
-        /* The device has no no matching format. Pick one from
-         * the supported formats, and later use converter to
-         * convert it to the required format.
-         */
-        pj_assert(di.fmt_cnt != 0);
-        vparam.fmt.id = di.fmt[0].id;
-    }
-
-    pj_strdup2_with_null(pool, &vp->dev_name, di.name);
-    vp->stream_role = di.has_callback ? ROLE_ACTIVE : ROLE_PASSIVE;
-
+    pj_ansi_snprintf(dev_name, sizeof(dev_name), "%s [%s]", di.name, di.driver);
     pjmedia_fourcc_name(vparam.fmt.id, fmt_name);
-
     PJ_LOG(4,(THIS_FILE,
 	      "Opening device %s for %s: format=%s, size=%dx%d @%d:%d fps",
 	      dev_name,
 	      vid_dir_name(prm->vidparam.dir), fmt_name,
 	      vfd->size.w, vfd->size.h,
 	      vfd->fps.num, vfd->fps.denum));
+
+    if (di.dir == PJMEDIA_DIR_RENDER) {
+	/* Find the matching format. If no exact match is found, find 
+	 * the supported format with the same color space. If no match is found,
+	 * use the first supported format on the list.
+	 */
+	pj_assert(di.fmt_cnt != 0);
+	vparam.fmt.id = get_match_format_id(prm->vidparam.fmt.id, &di);
+    } else {
+	struct fmt_prop match_prop;
+
+	if (di.fmt_cnt == 0) {
+	    status = PJMEDIA_EVID_SYSERR;
+	    PJ_PERROR(4,(THIS_FILE, status, "Device has no supported format"));
+	    return status;
+	}
+
+#if ENABLE_TEST_FIND_FMT
+	test_find_closest_fmt(&di);
+#endif
+
+	match_prop = find_closest_fmt(prm->vidparam.fmt.id, 
+				      &vfd->size,			     
+				      &vfd->fps, 
+				      &di);
+
+	if ((match_prop.id != prm->vidparam.fmt.id) || 
+	    (match_prop.size.w != vfd->size.w) ||
+	    (match_prop.size.h != vfd->size.h))
+	{
+	    vparam.fmt.id = match_prop.id;
+	    vparam.fmt.det.vid.size = match_prop.size;
+	}
+    }
+
+    pj_strdup2_with_null(pool, &vp->dev_name, di.name);
+    vp->stream_role = di.has_callback ? ROLE_ACTIVE : ROLE_PASSIVE;
 
     ptime_usec = PJMEDIA_PTIME(&vfd->fps);
     pjmedia_clock_src_init(&vp->clocksrc, PJMEDIA_TYPE_VIDEO,
@@ -276,6 +595,7 @@ PJ_DEF(pj_status_t) pjmedia_vid_port_create( pj_pool_t *pool,
     if (status != PJ_SUCCESS)
 	goto on_error;
 
+    pjmedia_fourcc_name(vparam.fmt.id, fmt_name);
     PJ_LOG(4,(THIS_FILE,
 	      "Device %s opened: format=%s, size=%dx%d @%d:%d fps",
 	      dev_name, fmt_name,
@@ -326,8 +646,10 @@ PJ_DEF(pj_status_t) pjmedia_vid_port_create( pj_pool_t *pool,
 	/* Always need to create media port for passive role */
 	vp->pasv_port = pp = PJ_POOL_ZALLOC_T(pool, vid_pasv_port);
 	pp->vp = vp;
-	pp->base.get_frame = &vid_pasv_port_get_frame;
-	pp->base.put_frame = &vid_pasv_port_put_frame;
+	if (prm->vidparam.dir & PJMEDIA_DIR_CAPTURE)
+	    pp->base.get_frame = &vid_pasv_port_get_frame;
+	if (prm->vidparam.dir & PJMEDIA_DIR_RENDER)
+	    pp->base.put_frame = &vid_pasv_port_put_frame;
 	pjmedia_port_info_init2(&pp->base.info, &vp->dev_name,
 	                        PJMEDIA_SIG_VID_PORT,
 			        prm->vidparam.dir, &prm->vidparam.fmt);
@@ -336,24 +658,15 @@ PJ_DEF(pj_status_t) pjmedia_vid_port_create( pj_pool_t *pool,
     }
 
     if (need_frame_buf) {
-	const pjmedia_video_format_info *vfi;
 	pjmedia_video_apply_fmt_param vafp;
 
-	vfi = pjmedia_get_video_format_info(NULL, vparam.fmt.id);
-	if (!vfi) {
-	    status = PJ_ENOTFOUND;
-	    goto on_error;
-	}
-
-	pj_bzero(&vafp, sizeof(vafp));
-	vafp.size = vparam.fmt.det.vid.size;
-	status = vfi->apply_fmt(vfi, &vafp);
+	status = get_vfi(&vp->conv.conv_param.src, NULL, &vafp);
 	if (status != PJ_SUCCESS)
 	    goto on_error;
 
         vp->frm_buf = PJ_POOL_ZALLOC_T(pool, pjmedia_frame);
         vp->frm_buf_size = vafp.framebytes;
-        vp->frm_buf->buf = pj_pool_alloc(pool, vafp.framebytes);
+        vp->frm_buf->buf = pj_pool_zalloc(pool, vafp.framebytes);
         vp->frm_buf->size = vp->frm_buf_size;
         vp->frm_buf->type = PJMEDIA_FRAME_TYPE_NONE;
 
@@ -419,6 +732,16 @@ pjmedia_vid_port_set_clock_src( pjmedia_vid_port *vid_port,
 }
 
 
+PJ_DEF(pj_status_t) pjmedia_vid_port_subscribe_event(
+						pjmedia_vid_port *vp,
+						pjmedia_port *port)
+{
+    PJ_ASSERT_RETURN(vp && port, PJ_EINVAL);
+
+    /* Subscribe to port's events */
+    return pjmedia_event_subscribe(NULL, &client_port_event_cb, vp, port);
+}
+
 PJ_DEF(pj_status_t) pjmedia_vid_port_connect(pjmedia_vid_port *vp,
 					      pjmedia_port *port,
 					      pj_bool_t destroy)
@@ -463,6 +786,36 @@ PJ_DEF(pj_status_t) pjmedia_vid_port_start(pjmedia_vid_port *vp)
     status = pjmedia_vid_dev_stream_start(vp->strm);
     if (status != PJ_SUCCESS)
 	goto on_error;
+
+    /* Initialize buffer with black color */
+    {
+        const pjmedia_video_format_info *vfi;
+        const pjmedia_format *fmt;
+	pjmedia_video_apply_fmt_param vafp;
+	pjmedia_frame frame;
+
+	pj_bzero(&frame, sizeof(pjmedia_frame));
+	frame.buf = vp->frm_buf->buf;
+	frame.size = vp->frm_buf_size;
+
+	fmt = &vp->conv.conv_param.src;
+	status = get_vfi(fmt, &vfi, &vafp);
+	if (status == PJ_SUCCESS && frame.buf) {
+	    frame.type = PJMEDIA_FRAME_TYPE_VIDEO;
+	    pj_assert(frame.size >= vafp.framebytes);
+	    frame.size = vafp.framebytes;
+	    
+	    if (vfi->color_model == PJMEDIA_COLOR_MODEL_RGB) {
+	    	pj_memset(frame.buf, 0, vafp.framebytes);
+	    } else if (fmt->id == PJMEDIA_FORMAT_I420 ||
+	  	       fmt->id == PJMEDIA_FORMAT_YV12)
+	    {	    	
+	    	pj_memset(frame.buf, 16, vafp.plane_bytes[0]);
+	    	pj_memset((pj_uint8_t*)frame.buf + vafp.plane_bytes[0],
+		      	  0x80, vafp.plane_bytes[1] * 2);
+	    }
+        }
+    }
 
     if (vp->clock) {
 	status = pjmedia_clock_start(vp->clock);
@@ -577,16 +930,54 @@ static pj_status_t client_port_event_cb(pjmedia_event *event,
 
     if (event->type == PJMEDIA_EVENT_FMT_CHANGED) {
         const pjmedia_video_format_detail *vfd;
+        const pjmedia_video_format_detail *vfd_cur;
         pjmedia_vid_dev_param vid_param;
         pj_status_t status;
         
-	pjmedia_vid_port_stop(vp);
-        
-        /* Retrieve the video format detail */
+        /* Retrieve the current video format detail */
+        pjmedia_vid_dev_stream_get_param(vp->strm, &vid_param);
+        vfd_cur = pjmedia_format_get_video_format_detail(
+		  &vid_param.fmt, PJ_TRUE);
+        if (!vfd_cur)
+            return PJMEDIA_EVID_BADFORMAT;
+
+        /* Retrieve the new video format detail */
         vfd = pjmedia_format_get_video_format_detail(
                   &event->data.fmt_changed.new_fmt, PJ_TRUE);
         if (!vfd || !vfd->fps.num || !vfd->fps.denum)
             return PJMEDIA_EVID_BADFORMAT;
+
+	/* Ticket #1876: if this is a passive renderer and only frame rate is
+	 * changing, simply modify the clock.
+	 */
+	if (vp->dir == PJMEDIA_DIR_RENDER &&
+	    vp->stream_role == ROLE_PASSIVE && vp->role == ROLE_ACTIVE)
+	{
+	    pj_bool_t fps_only;
+	    pjmedia_video_format_detail tmp_vfd;
+	    
+	    tmp_vfd = *vfd_cur;
+	    tmp_vfd.fps = vfd->fps;
+	    fps_only = pj_memcmp(vfd, &tmp_vfd, sizeof(*vfd)) == 0;
+	    if (fps_only) {
+		pjmedia_clock_param clock_param;
+		clock_param.usec_interval = PJMEDIA_PTIME(&vfd->fps);
+		clock_param.clock_rate = vid_param.clock_rate;
+		pjmedia_clock_modify(vp->clock, &clock_param);
+
+		return pjmedia_event_publish(NULL, vp, event,
+					     PJMEDIA_EVENT_PUBLISH_POST_EVENT);
+	    }
+	}
+
+	/* Ticket #1827:
+	 * Stopping video port should not be necessary here because
+	 * it will also try to stop the clock, from inside the clock's
+	 * own thread, so it may get stuck. We just stop the video device
+	 * stream instead.
+	 * pjmedia_vid_port_stop(vp);
+	 */
+	pjmedia_vid_dev_stream_stop(vp->strm);
         
 	/* Change the destination format to the new format */
 	pjmedia_format_copy(&vp->conv.conv_param.src,
@@ -601,7 +992,6 @@ static pj_status_t client_port_event_cb(pjmedia_event *event,
 	    return status;
 	}
 
-        pjmedia_vid_dev_stream_get_param(vp->strm, &vid_param);
         if (vid_param.fmt.id != vp->conv.conv_param.dst.id ||
             (vid_param.fmt.det.vid.size.h !=
              vp->conv.conv_param.dst.det.vid.size.h) ||
@@ -609,19 +999,30 @@ static pj_status_t client_port_event_cb(pjmedia_event *event,
              vp->conv.conv_param.dst.det.vid.size.w))
         {
             status = pjmedia_vid_dev_stream_set_cap(vp->strm,
-                                                    PJMEDIA_VID_DEV_CAP_FORMAT,
-                                                    &vp->conv.conv_param.dst);
+                                                PJMEDIA_VID_DEV_CAP_FORMAT,
+                                                &vp->conv.conv_param.dst);
             if (status != PJ_SUCCESS) {
-                PJ_LOG(3, (THIS_FILE, "failure in changing the format of the "
-                                      "video device"));
+		pjmedia_event e;
+
+                PJ_PERROR(3,(THIS_FILE, status,
+		    "failure in changing the format of the video device"));
                 PJ_LOG(3, (THIS_FILE, "reverting to its original format: %s",
                                       status != PJMEDIA_EVID_ERR ? "success" :
                                       "failure"));
+
+		pjmedia_event_init(&e, PJMEDIA_EVENT_VID_DEV_ERROR, NULL, vp);
+		e.data.vid_dev_err.dir = vp->dir;
+		e.data.vid_dev_err.status = status;
+		e.data.vid_dev_err.id = (vp->dir==PJMEDIA_DIR_ENCODING?
+					 vid_param.cap_id : vid_param.rend_id);
+		pjmedia_event_publish(NULL, vp, &e,
+				      PJMEDIA_EVENT_PUBLISH_POST_EVENT);
+
                 return status;
             }
         }
         
-        if (vp->stream_role == ROLE_PASSIVE) {
+        if (vp->role == ROLE_ACTIVE && vp->stream_role == ROLE_PASSIVE) {
             pjmedia_clock_param clock_param;
             
             /**
@@ -635,7 +1036,14 @@ static pj_status_t client_port_event_cb(pjmedia_event *event,
             pjmedia_clock_modify(vp->clock, &clock_param);
         }
         
-	pjmedia_vid_port_start(vp);
+	/* pjmedia_vid_port_start(vp); */
+	pjmedia_vid_dev_stream_start(vp->strm);
+
+	/* Update passive port info from the video stream */
+	if (vp->role == ROLE_PASSIVE) {
+	    pjmedia_format_copy(&vp->pasv_port->base.info.fmt,
+				&event->data.fmt_changed.new_fmt);
+	}
     }
     
     /* Republish the event, post the event to the event manager
@@ -656,6 +1064,9 @@ static pj_status_t convert_frame(pjmedia_vid_port *vp,
             dst_frame->buf  = vp->conv.conv_buf;
 	    dst_frame->size = vp->conv.conv_buf_size;
         }
+	dst_frame->type	     = src_frame->type;
+	dst_frame->timestamp = src_frame->timestamp;
+	dst_frame->bit_info  = src_frame->bit_info;
 	status = pjmedia_converter_convert(vp->conv.conv,
 					   src_frame, dst_frame);
     }
@@ -951,8 +1362,12 @@ static pj_status_t vid_pasv_port_get_frame(struct pjmedia_port *this_port,
         /* We are passive and the stream is passive.
          * The decoding counterpart is in vid_pasv_port_put_frame().
          */
-	status = pjmedia_vid_dev_stream_get_frame(vp->strm, (vp->conv.conv?
-                                                  vp->frm_buf: frame));
+    	pjmedia_frame *get_frm = vp->conv.conv? vp->frm_buf : frame;
+
+    	if (vp->conv.conv)
+            get_frm->size = vp->frm_buf_size;
+
+    	status = pjmedia_vid_dev_stream_get_frame(vp->strm, get_frm);
 	if (status != PJ_SUCCESS)
 	    return status;
 

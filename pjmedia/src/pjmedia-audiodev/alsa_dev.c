@@ -44,9 +44,12 @@
 #define MAX_SOUND_CARDS 		5
 #define MAX_SOUND_DEVICES_PER_CARD 	5
 #define MAX_DEVICES			32
+#define MAX_MIX_NAME_LEN                64 
 
 /* Set to 1 to enable tracing */
-#if 0
+#define ENABLE_TRACING			0
+
+#if ENABLE_TRACING
 #	define TRACE_(expr)		PJ_LOG(5,expr)
 #else
 #	define TRACE_(expr)
@@ -97,6 +100,7 @@ struct alsa_factory
 
     unsigned			 dev_cnt;
     pjmedia_aud_dev_info	 devs[MAX_DEVICES];
+    char                         pb_mixer_name[MAX_MIX_NAME_LEN];
 };
 
 struct alsa_stream
@@ -149,6 +153,7 @@ static pjmedia_aud_stream_op alsa_stream_op =
     &alsa_stream_destroy
 };
 
+#if ENABLE_TRACING==0
 static void null_alsa_error_handler (const char *file,
 				int line,
 				const char *function,
@@ -162,6 +167,7 @@ static void null_alsa_error_handler (const char *file,
     PJ_UNUSED_ARG(err);
     PJ_UNUSED_ARG(fmt);
 }
+#endif
 
 static void alsa_error_handler (const char *file,
 				int line,
@@ -241,8 +247,11 @@ static pj_status_t add_dev (struct alsa_factory *af, const char *dev_name)
 
     /* Check if the device could be opened in playback or capture mode */
     if (pb_result<0 && ca_result<0) {
-	TRACE_((THIS_FILE, "Unable to open sound device %s", dev_name));
-	return PJMEDIA_EAUD_NODEV;
+	TRACE_((THIS_FILE, "Unable to open sound device %s, setting "
+	        	   "in/out channel count to 0", dev_name));
+	/* Set I/O channel counts to 0 to indicate unavailable device */
+	adi->output_count = 0;
+	adi->input_count =  0;
     }
 
     /* Reset device info */
@@ -268,6 +277,44 @@ static pj_status_t add_dev (struct alsa_factory *af, const char *dev_name)
     PJ_LOG (5,(THIS_FILE, "Added sound device %s", adi->name));
 
     return PJ_SUCCESS;
+}
+
+static void get_mixer_name(struct alsa_factory *af)
+{
+    snd_mixer_t *handle;
+    snd_mixer_elem_t *elem;
+
+    if (snd_mixer_open(&handle, 0) < 0)
+	return;
+
+    if (snd_mixer_attach(handle, "default") < 0) {
+	snd_mixer_close(handle);
+	return;
+    }
+
+    if (snd_mixer_selem_register(handle, NULL, NULL) < 0) {
+	snd_mixer_close(handle);
+	return;
+    }
+
+    if (snd_mixer_load(handle) < 0) {
+	snd_mixer_close(handle);
+	return;
+    }
+
+    for (elem = snd_mixer_first_elem(handle); elem;
+	 elem = snd_mixer_elem_next(elem))
+    {
+	if (snd_mixer_selem_is_active(elem) &&
+	    snd_mixer_selem_has_playback_volume(elem))
+	{
+	    pj_ansi_strncpy(af->pb_mixer_name, snd_mixer_selem_get_name(elem),
+	    		    sizeof(af->pb_mixer_name));
+	    TRACE_((THIS_FILE, "Playback mixer name: %s", af->pb_mixer_name));
+	    break;
+	}
+    }
+    snd_mixer_close(handle);
 }
 
 
@@ -342,18 +389,26 @@ static pj_status_t alsa_factory_refresh(pjmedia_aud_dev_factory *f)
     if (err != 0)
 	return PJMEDIA_EAUD_SYSERR;
 
+#if ENABLE_TRACING
+    snd_lib_error_set_handler(alsa_error_handler);
+#else
     /* Set a null error handler prior to enumeration to suppress errors */
     snd_lib_error_set_handler(null_alsa_error_handler);
+#endif
 
     n = hints;
     while (*n != NULL) {
 	char *name = snd_device_name_get_hint(*n, "NAME");
-	if (name != NULL && 0 != strcmp("null", name)) {
-	    add_dev(af, name);
+	if (name != NULL) {
+	    if (0 != strcmp("null", name))
+		add_dev(af, name);
 	    free(name);
 	}
 	n++;
     }
+
+    /* Get the mixer name */
+    get_mixer_name(af);
 
     /* Install error handler after enumeration, otherwise we'll get many
      * error messages about invalid card/device ID.
@@ -478,7 +533,7 @@ static int pb_thread_func (void *arg)
 	tstamp.u64 += nframes;
     }
 
-    snd_pcm_drain (pcm);
+    snd_pcm_drop(pcm);
     TRACE_((THIS_FILE, "pb_thread_func: Stopped"));
     return PJ_SUCCESS;
 }
@@ -549,7 +604,7 @@ static int ca_thread_func (void *arg)
 
 	tstamp.u64 += nframes;
     }
-    snd_pcm_drain (pcm);
+    snd_pcm_drop(pcm);
     TRACE_((THIS_FILE, "ca_thread_func: Stopped"));
 
     return PJ_SUCCESS;
@@ -634,6 +689,8 @@ static pj_status_t open_playback (struct alsa_stream* stream,
     tmp_period_size = stream->pb_frames;
     snd_pcm_hw_params_set_period_size_near (stream->pb_pcm, params,
 					    &tmp_period_size, NULL);
+    stream->pb_frames = tmp_period_size > stream->pb_frames ? tmp_period_size : 
+                                                              stream->pb_frames;					    					    
     TRACE_((THIS_FILE, "open_playback: period size set to: %d",
 	    tmp_period_size));
 
@@ -752,6 +809,8 @@ static pj_status_t open_capture (struct alsa_stream* stream,
     tmp_period_size = stream->ca_frames;
     snd_pcm_hw_params_set_period_size_near (stream->ca_pcm, params,
 					    &tmp_period_size, NULL);
+    stream->ca_frames = tmp_period_size > stream->ca_frames ? tmp_period_size : 
+                                                              stream->ca_frames;
     TRACE_((THIS_FILE, "open_capture: period size set to: %d",
 	    tmp_period_size));
 
@@ -891,9 +950,43 @@ static pj_status_t alsa_stream_set_cap(pjmedia_aud_stream *strm,
 				       pjmedia_aud_dev_cap cap,
 				       const void *value)
 {
-    PJ_UNUSED_ARG(strm);
-    PJ_UNUSED_ARG(cap);
-    PJ_UNUSED_ARG(value);
+    struct alsa_factory *af = ((struct alsa_stream*)strm)->af;
+
+    if (cap==PJMEDIA_AUD_DEV_CAP_OUTPUT_VOLUME_SETTING && 
+	pj_ansi_strlen(af->pb_mixer_name)) 
+    {
+	pj_ssize_t min, max;
+	snd_mixer_t *handle;
+	snd_mixer_selem_id_t *sid;
+	snd_mixer_elem_t* elem;
+	unsigned vol = *(unsigned*)value;
+
+	if (snd_mixer_open(&handle, 0) < 0)
+	    return PJMEDIA_EAUD_SYSERR;
+
+	if (snd_mixer_attach(handle, "default") < 0)
+	    return PJMEDIA_EAUD_SYSERR;
+
+	if (snd_mixer_selem_register(handle, NULL, NULL) < 0)
+	    return PJMEDIA_EAUD_SYSERR;
+
+	if (snd_mixer_load(handle) < 0)
+	    return PJMEDIA_EAUD_SYSERR;
+
+	snd_mixer_selem_id_alloca(&sid);
+	snd_mixer_selem_id_set_index(sid, 0);
+	snd_mixer_selem_id_set_name(sid, af->pb_mixer_name);
+	elem = snd_mixer_find_selem(handle, sid);
+	if (!elem)
+	    return PJMEDIA_EAUD_SYSERR;
+
+	snd_mixer_selem_get_playback_volume_range(elem, &min, &max);
+	if (snd_mixer_selem_set_playback_volume_all(elem, vol * max / 100) < 0)
+	    return PJMEDIA_EAUD_SYSERR;
+
+	snd_mixer_close(handle);
+	return PJ_SUCCESS;
+    }
 
     return PJMEDIA_EAUD_INVCAP;
 }

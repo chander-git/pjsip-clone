@@ -23,6 +23,9 @@
 
 #define MAX_APP_OPTIONS 128
 
+#define str(s) #s
+#define xstr(s) str(s)
+
 char   *stdout_refresh_text = "STDOUT_REFRESH";
 
 /* Show usage */
@@ -137,21 +140,27 @@ static void usage(void)
     puts  ("                      frequencies, and ON,OFF=on/off duration in msec.");
     puts  ("                      This can be specified multiple times.");
     puts  ("  --auto-play         Automatically play the file (to incoming calls only)");
+    puts  ("  --auto-play-hangup  Automatically hangup the file after file play completes");
     puts  ("  --auto-loop         Automatically loop incoming RTP to outgoing RTP");
     puts  ("  --auto-conf         Automatically put calls in conference with others");
     puts  ("  --rec-file=file     Open file recorder (extension can be .wav or .mp3");
     puts  ("  --auto-rec          Automatically record conversation");
-    puts  ("  --quality=N         Specify media quality (0-10, default=6)");
+    puts  ("  --quality=N         Specify media quality (0-10, default="
+    				  xstr(PJSUA_DEFAULT_CODEC_QUALITY) ")");
     puts  ("  --ptime=MSEC        Override codec ptime to MSEC (default=specific)");
     puts  ("  --no-vad            Disable VAD/silence detector (default=vad enabled)");
-    puts  ("  --ec-tail=MSEC      Set echo canceller tail length (default=256)");
+    puts  ("  --ec-tail=MSEC      Set echo canceller tail length (default="
+	   			  xstr(PJSUA_DEFAULT_EC_TAIL_LEN) ")");
     puts  ("  --ec-opt=OPT        Select echo canceller algorithm (0=default, ");
-    puts  ("                        1=speex, 2=suppressor)");
-    puts  ("  --ilbc-mode=MODE    Set iLBC codec mode (20 or 30, default is 30)");
+    puts  ("                        1=speex, 2=suppressor, 3=WebRtc)");
+    puts  ("  --ilbc-mode=MODE    Set iLBC codec mode (20 or 30, default is "
+    				  xstr(PJSUA_DEFAULT_ILBC_MODE) ")");
     puts  ("  --capture-dev=id    Audio capture device ID (default=-1)");
     puts  ("  --playback-dev=id   Audio playback device ID (default=-1)");
-    puts  ("  --capture-lat=N     Audio capture latency, in ms (default=100)");
-    puts  ("  --playback-lat=N    Audio playback latency, in ms (default=100)");
+    puts  ("  --capture-lat=N     Audio capture latency, in ms (default="
+    				  xstr(PJMEDIA_SND_DEFAULT_REC_LATENCY) ")");
+    puts  ("  --playback-lat=N    Audio playback latency, in ms (default="
+    				  xstr(PJMEDIA_SND_DEFAULT_PLAY_LATENCY) ")");
     puts  ("  --snd-auto-close=N  Auto close audio device when idle for N secs (default=1)");
     puts  ("                      Specify N=-1 to disable this feature.");
     puts  ("                      Specify N=0 for instant close when unused.");
@@ -183,7 +192,23 @@ static void usage(void)
     puts  ("  --turn-tcp          Use TCP connection to TURN server (default no)");
     puts  ("  --turn-user         TURN username");
     puts  ("  --turn-passwd       TURN password");
-
+    puts  ("  --rtcp-mux          Enable RTP & RTCP multiplexing (default: no)");
+#if defined(PJMEDIA_HAS_SRTP) && (PJMEDIA_HAS_SRTP != 0)
+    puts  ("  --srtp-keying       SRTP keying method for outgoing SDP offer.");
+    puts  ("                      0=SDES (default), 1=DTLS");
+#endif
+#if PJ_HAS_SSL_SOCK
+    puts  ("");
+    puts  ("TURN TLS Options:");
+    puts  ("  --turn-tls          Use TLS connection to TURN server (default no)");
+    puts  ("  --turn-tls-ca-file  Specify TURN TLS CA file (default=none)");
+    puts  ("  --turn-tls-cert-file  Specify TURN TLS certificate file (default=none)");
+    puts  ("  --turn-tls-privkey-file  Specify TURN TLS private key file (default=none)");
+    puts  ("  --turn-tls-privkey-pwd Specify TURN TLS password to private key file (default=none)");
+    puts  ("  --turn-tls-neg-timeout Specify TURN TLS negotiation timeout (default=no)");
+    puts  ("  --turn-tls-cipher   Specify prefered TURN TLS cipher (optional).");
+    puts  ("                      May be specified multiple times");
+#endif
     puts  ("");
     puts  ("Buddy List (can be more than one):");
     puts  ("  --add-buddy url     Add the specified URL to the buddy list.");
@@ -211,6 +236,12 @@ static void usage(void)
     puts  ("When URL is specified, pjsua will immediately initiate call to that URL");
     puts  ("");
 
+    fflush(stdout);
+}
+
+static void log_writer_nobuf(int level, const char *buffer, int len)
+{
+    pj_log_write(level, buffer, len);
     fflush(stdout);
 }
 
@@ -253,9 +284,9 @@ static int read_config_file(pj_pool_t *pool, const char *filename,
 
 	// Trim ending newlines
 	len = strlen(line);
-	if (line[len-1]=='\n')
+	if (len > 0 && line[len-1]=='\n')
 	    line[--len] = '\0';
-	if (line[len-1]=='\r')
+	if (len > 0 && line[len-1]=='\r')
 	    line[--len] = '\0';
 
 	if (len==0) continue;
@@ -341,7 +372,11 @@ static pj_status_t parse_args(int argc, char *argv[],
 	   OPT_AUTO_CONF, OPT_CLOCK_RATE, OPT_SND_CLOCK_RATE, OPT_STEREO,
 	   OPT_USE_ICE, OPT_ICE_REGULAR, OPT_USE_SRTP, OPT_SRTP_SECURE,
 	   OPT_USE_TURN, OPT_ICE_MAX_HOSTS, OPT_ICE_NO_RTCP, OPT_TURN_SRV,
-	   OPT_TURN_TCP, OPT_TURN_USER, OPT_TURN_PASSWD,
+	   OPT_TURN_TCP, OPT_TURN_USER, OPT_TURN_PASSWD, OPT_TURN_TLS, 
+	   OPT_TURN_TLS_CA_FILE, OPT_TURN_TLS_CERT_FILE, 
+	   OPT_TURN_TLS_NEG_TIMEOUT, OPT_TURN_TLS_CIPHER,
+	   OPT_TURN_TLS_PRIV_FILE, OPT_TURN_TLS_PASSWORD,
+	   OPT_RTCP_MUX, OPT_SRTP_KEYING,
 	   OPT_PLAY_FILE, OPT_PLAY_TONE, OPT_RTP_PORT, OPT_ADD_CODEC,
 	   OPT_ILBC_MODE, OPT_REC_FILE, OPT_AUTO_REC,
 	   OPT_COMPLEXITY, OPT_QUALITY, OPT_PTIME, OPT_NO_VAD,
@@ -432,12 +467,23 @@ static pj_status_t parse_args(int argc, char *argv[],
 	{ "ice-no-rtcp",0, 0, OPT_ICE_NO_RTCP},
 	{ "turn-srv",	1, 0, OPT_TURN_SRV},
 	{ "turn-tcp",	0, 0, OPT_TURN_TCP},
+#if PJ_HAS_SSL_SOCK
+	{ "turn-tls",	0, 0, OPT_TURN_TLS},
+	{ "turn-tls-ca-file",1, 0, OPT_TURN_TLS_CA_FILE},
+	{ "turn-tls-cert-file",1,0, OPT_TURN_TLS_CERT_FILE},
+	{ "turn-tls-privkey-file",1,0, OPT_TURN_TLS_PRIV_FILE},
+	{ "turn-tls-privkey-pwd",1,0, OPT_TURN_TLS_PASSWORD},
+	{ "turn-tls-neg-timeout", 1, 0, OPT_TURN_TLS_NEG_TIMEOUT},
+	{ "turn-tls-cipher", 1, 0, OPT_TURN_TLS_CIPHER},
+#endif
 	{ "turn-user",	1, 0, OPT_TURN_USER},
 	{ "turn-passwd",1, 0, OPT_TURN_PASSWD},
+	{ "rtcp-mux",	0, 0, OPT_RTCP_MUX},
 
 #if defined(PJMEDIA_HAS_SRTP) && (PJMEDIA_HAS_SRTP != 0)
 	{ "use-srtp",   1, 0, OPT_USE_SRTP},
 	{ "srtp-secure",1, 0, OPT_SRTP_SECURE},
+	{ "srtp-keying",1, 0, OPT_SRTP_KEYING},
 #endif
 	{ "add-codec",  1, 0, OPT_ADD_CODEC},
 	{ "dis-codec",  1, 0, OPT_DIS_CODEC},
@@ -545,7 +591,7 @@ static pj_status_t parse_args(int argc, char *argv[],
 	    break;
 
 	case OPT_LOG_LEVEL:
-	    c = pj_strtoul(pj_cstr(&tmp, pj_optarg));
+	    c = (int)pj_strtoul(pj_cstr(&tmp, pj_optarg));
 	    if (c < 0 || c > 6) {
 		PJ_LOG(1,(THIS_FILE,
 			  "Error: expecting integer value 0-6 "
@@ -557,7 +603,7 @@ static pj_status_t parse_args(int argc, char *argv[],
 	    break;
 
 	case OPT_APP_LOG_LEVEL:
-	    cfg->log_cfg.console_level = pj_strtoul(pj_cstr(&tmp, pj_optarg));
+	    cfg->log_cfg.console_level = (unsigned)pj_strtoul(pj_cstr(&tmp, pj_optarg));
 	    if (cfg->log_cfg.console_level > 6) {
 		PJ_LOG(1,(THIS_FILE,
 			  "Error: expecting integer value 0-6 "
@@ -589,7 +635,9 @@ static pj_status_t parse_args(int argc, char *argv[],
 
 	case OPT_NO_STDERR:
 #if !defined(PJ_WIN32_WINCE) || PJ_WIN32_WINCE==0
-	    freopen("/dev/null", "w", stderr);
+	    if (!freopen("/dev/null", "w", stderr)) {
+		PJ_LOG(4,(THIS_FILE, "Failed reopening dev/null"));
+	    }
 #endif
 	    break;
 
@@ -612,7 +660,7 @@ static pj_status_t parse_args(int argc, char *argv[],
 				     "8000-192000 for conference clock rate"));
 		return PJ_EINVAL;
 	    }
-	    cfg->media_cfg.clock_rate = lval;
+	    cfg->media_cfg.clock_rate = (unsigned)lval;
 	    break;
 
 	case OPT_SND_CLOCK_RATE:
@@ -622,7 +670,7 @@ static pj_status_t parse_args(int argc, char *argv[],
 				     "8000-192000 for sound device clock rate"));
 		return PJ_EINVAL;
 	    }
-	    cfg->media_cfg.snd_clock_rate = lval;
+	    cfg->media_cfg.snd_clock_rate = (unsigned)lval;
 	    break;
 
 	case OPT_STEREO:
@@ -703,7 +751,7 @@ static pj_status_t parse_args(int argc, char *argv[],
 	    break;
 
 	case OPT_REG_TIMEOUT:   /* reg-timeout */
-	    cur_acc->reg_timeout = pj_strtoul(pj_cstr(&tmp,pj_optarg));
+	    cur_acc->reg_timeout = (unsigned)pj_strtoul(pj_cstr(&tmp,pj_optarg));
 	    if (cur_acc->reg_timeout < 1 || cur_acc->reg_timeout > 3600) {
 		PJ_LOG(1,(THIS_FILE,
 			  "Error: invalid value for --reg-timeout "
@@ -732,12 +780,12 @@ static pj_status_t parse_args(int argc, char *argv[],
 			  "Error: expecting integer value 0-3 for --use-timer"));
 		return PJ_EINVAL;
 	    }
-	    cur_acc->use_timer = lval;
-	    cfg->cfg.use_timer = lval;
+	    cur_acc->use_timer = (pjsua_sip_timer_use)lval;
+	    cfg->cfg.use_timer = (pjsua_sip_timer_use)lval;
 	    break;
 
 	case OPT_TIMER_SE: /** session timer session expiration */
-	    cur_acc->timer_setting.sess_expires = pj_strtoul(pj_cstr(&tmp, pj_optarg));
+	    cur_acc->timer_setting.sess_expires = (unsigned)pj_strtoul(pj_cstr(&tmp, pj_optarg));
 	    if (cur_acc->timer_setting.sess_expires < 90) {
 		PJ_LOG(1,(THIS_FILE,
 			  "Error: invalid value for --timer-se "
@@ -748,7 +796,7 @@ static pj_status_t parse_args(int argc, char *argv[],
 	    break;
 
 	case OPT_TIMER_MIN_SE: /** session timer minimum session expiration */
-	    cur_acc->timer_setting.min_se = pj_strtoul(pj_cstr(&tmp, pj_optarg));
+	    cur_acc->timer_setting.min_se = (unsigned)pj_strtoul(pj_cstr(&tmp, pj_optarg));
 	    if (cur_acc->timer_setting.min_se < 90) {
 		PJ_LOG(1,(THIS_FILE,
 			  "Error: invalid value for --timer-min-se "
@@ -795,7 +843,7 @@ static pj_status_t parse_args(int argc, char *argv[],
 	    break;
 
 	case OPT_AUTO_UPDATE_NAT:   /* OPT_AUTO_UPDATE_NAT */
-            cur_acc->allow_contact_rewrite  = pj_strtoul(pj_cstr(&tmp, pj_optarg));
+            cur_acc->allow_contact_rewrite  = (pj_bool_t)pj_strtoul(pj_cstr(&tmp, pj_optarg));
 	    break;
 
 	case OPT_DISABLE_STUN:
@@ -806,11 +854,10 @@ static pj_status_t parse_args(int argc, char *argv[],
 	case OPT_USE_COMPACT_FORM:
 	    /* enable compact form - from Ticket #342 */
             {
-		extern pj_bool_t pjsip_use_compact_form;
 		extern pj_bool_t pjsip_include_allow_hdr_in_dlg;
 		extern pj_bool_t pjmedia_add_rtpmap_for_static_pt;
 
-		pjsip_use_compact_form = PJ_TRUE;
+		pjsip_cfg()->endpt.use_compact_form = PJ_TRUE;
 		/* do not transmit Allow header */
 		pjsip_include_allow_hdr_in_dlg = PJ_FALSE;
 		/* Do not include rtpmap for static payload types (<96) */
@@ -856,7 +903,7 @@ static pj_status_t parse_args(int argc, char *argv[],
 	    break;
 
 	case OPT_REG_RETRY_INTERVAL:
-	    cur_acc->reg_retry_interval = pj_strtoul(pj_cstr(&tmp, pj_optarg));
+	    cur_acc->reg_retry_interval = (unsigned)pj_strtoul(pj_cstr(&tmp, pj_optarg));
 	    break;
 
 	case OPT_REG_USE_PROXY:
@@ -987,6 +1034,80 @@ static pj_status_t parse_args(int argc, char *argv[],
 		    cur_acc->turn_cfg.turn_conn_type = PJ_TURN_TP_TCP;
 	    break;
 
+#if PJ_HAS_SSL_SOCK
+	case OPT_TURN_TLS:
+	    cfg->media_cfg.turn_conn_type =
+		    cur_acc->turn_cfg.turn_conn_type = PJ_TURN_TP_TLS;
+	    break;
+	case OPT_TURN_TLS_CA_FILE:
+	    cfg->media_cfg.turn_tls_setting.ca_list_file =
+		cur_acc->turn_cfg.turn_tls_setting.ca_list_file =
+		    pj_str(pj_optarg);
+	    break;
+
+	case OPT_TURN_TLS_CERT_FILE:
+	    cfg->media_cfg.turn_tls_setting.cert_file =
+		cur_acc->turn_cfg.turn_tls_setting.cert_file =
+		    pj_str(pj_optarg);
+	    break;
+
+	case OPT_TURN_TLS_PRIV_FILE:
+	    cfg->media_cfg.turn_tls_setting.privkey_file =
+		cur_acc->turn_cfg.turn_tls_setting.privkey_file =
+		    pj_str(pj_optarg);
+	    break;
+
+	case OPT_TURN_TLS_PASSWORD:
+	    cfg->media_cfg.turn_tls_setting.password =
+		cur_acc->turn_cfg.turn_tls_setting.password =
+		    pj_str(pj_optarg);
+	    break;
+
+	case OPT_TURN_TLS_NEG_TIMEOUT:
+	    cfg->media_cfg.turn_tls_setting.ssock_param.timeout.sec =
+		cur_acc->turn_cfg.turn_tls_setting.ssock_param.timeout.sec =
+		    atoi(pj_optarg);
+	    break;
+
+	case OPT_TURN_TLS_CIPHER:
+	    {
+		pj_ssl_cipher cipher;
+
+		if (pj_ansi_strnicmp(pj_optarg, "0x", 2) == 0) {
+		    pj_str_t cipher_st = pj_str(pj_optarg + 2);
+		    cipher = (pj_ssl_cipher)pj_strtoul2(&cipher_st, NULL, 16);
+		} else {
+		    cipher = atoi(pj_optarg);
+		}
+
+		if (pj_ssl_cipher_is_supported(cipher)) {
+		    static pj_ssl_cipher tls_ciphers[PJ_SSL_SOCK_MAX_CIPHERS];
+		    pj_ssl_sock_param *ssock_param =
+				  &cfg->media_cfg.turn_tls_setting.ssock_param;
+
+		    tls_ciphers[ssock_param->ciphers_num++] = cipher;
+		    ssock_param->ciphers =
+		       cur_acc->turn_cfg.turn_tls_setting.ssock_param.ciphers =
+			    tls_ciphers;
+		} else {
+		    pj_ssl_cipher ciphers[PJ_SSL_SOCK_MAX_CIPHERS];
+		    unsigned j, ciphers_cnt;
+
+		    ciphers_cnt = PJ_ARRAY_SIZE(ciphers);
+		    pj_ssl_cipher_get_availables(ciphers, &ciphers_cnt);
+
+		    PJ_LOG(1,(THIS_FILE, "Cipher \"%s\" is not supported by "
+					 "TLS/SSL backend.", pj_optarg));
+		    printf("Available TLS/SSL ciphers (%d):\n", ciphers_cnt);
+		    for (j=0; j<ciphers_cnt; ++j)
+			printf("- 0x%06X: %s\n", ciphers[j], 
+			       pj_ssl_cipher_name(ciphers[j]));
+		    return -1;
+		}
+	    }
+ 	    break;
+#endif
+
 	case OPT_TURN_USER:
 	    cfg->media_cfg.turn_auth_cred.type =
 		    cur_acc->turn_cfg.turn_auth_cred.type = PJ_STUN_AUTH_CRED_STATIC;
@@ -1001,6 +1122,10 @@ static pj_status_t parse_args(int argc, char *argv[],
 		    cur_acc->turn_cfg.turn_auth_cred.data.static_cred.data_type = PJ_STUN_PASSWD_PLAIN;
 	    cfg->media_cfg.turn_auth_cred.data.static_cred.data =
 		    cur_acc->turn_cfg.turn_auth_cred.data.static_cred.data = pj_str(pj_optarg);
+	    break;
+
+	case OPT_RTCP_MUX:
+	    cur_acc->enable_rtcp_mux = PJ_TRUE;
 	    break;
 
 #if defined(PJMEDIA_HAS_SRTP) && (PJMEDIA_HAS_SRTP != 0)
@@ -1027,6 +1152,26 @@ static pj_status_t parse_args(int argc, char *argv[],
 		return -1;
 	    }
 	    cur_acc->srtp_secure_signaling = app_config.cfg.srtp_secure_signaling;
+	    break;
+	case OPT_SRTP_KEYING:
+	    app_config.srtp_keying = my_atoi(pj_optarg);
+	    if (!pj_isdigit(*pj_optarg) || app_config.srtp_keying < 0 ||
+		app_config.srtp_keying > 1)
+	    {
+		PJ_LOG(1,(THIS_FILE, "Invalid value for --srtp-keying option"));
+		return -1;
+	    }
+	    /* Set SRTP keying to use DTLS over SDES */
+	    if (app_config.srtp_keying == 1) {
+		pjsua_srtp_opt *srtp_opt = &app_config.cfg.srtp_opt;
+		srtp_opt->keying_count = 2;
+		srtp_opt->keying[0] = PJMEDIA_SRTP_KEYING_DTLS_SRTP;
+		srtp_opt->keying[1] = PJMEDIA_SRTP_KEYING_SDES;
+
+		cur_acc->srtp_opt.keying_count = 2;
+		cur_acc->srtp_opt.keying[0] = PJMEDIA_SRTP_KEYING_DTLS_SRTP;
+		cur_acc->srtp_opt.keying[1] = PJMEDIA_SRTP_KEYING_SDES;
+	    }
 	    break;
 #endif
 
@@ -1204,18 +1349,18 @@ static pj_status_t parse_args(int argc, char *argv[],
 
 		if (pj_ansi_strnicmp(pj_optarg, "0x", 2) == 0) {
 		    pj_str_t cipher_st = pj_str(pj_optarg + 2);
-		    cipher = pj_strtoul2(&cipher_st, NULL, 16);
+		    cipher = (pj_ssl_cipher)pj_strtoul2(&cipher_st, NULL, 16);
 		} else {
 		    cipher = atoi(pj_optarg);
 		}
 
 		if (pj_ssl_cipher_is_supported(cipher)) {
-		    static pj_ssl_cipher tls_ciphers[128];
+		    static pj_ssl_cipher tls_ciphers[PJ_SSL_SOCK_MAX_CIPHERS];
 
 		    tls_ciphers[cfg->udp_cfg.tls_setting.ciphers_num++] = cipher;
 		    cfg->udp_cfg.tls_setting.ciphers = tls_ciphers;
 		} else {
-		    pj_ssl_cipher ciphers[128];
+		    pj_ssl_cipher ciphers[PJ_SSL_SOCK_MAX_CIPHERS];
 		    unsigned j, ciphers_cnt;
 
 		    ciphers_cnt = PJ_ARRAY_SIZE(ciphers);
@@ -1251,6 +1396,7 @@ static pj_status_t parse_args(int argc, char *argv[],
 #ifdef _IONBF
 	case OPT_STDOUT_NO_BUF:
 	    setvbuf(stdout, NULL, _IONBF, 0);
+	    cfg->log_cfg.cb = &log_writer_nobuf;
 	    break;
 #endif
 
@@ -1721,6 +1867,9 @@ static void write_account_settings(int acc_index, pj_str_t *result)
 			acc_cfg->turn_cfg.turn_auth_cred.data.static_cred.data.ptr);
 	pj_strcat2(result, line);
     }
+
+    if (acc_cfg->enable_rtcp_mux)
+	pj_strcat2(result, "--rtcp-mux\n");
 }
 
 /*
@@ -1732,7 +1881,6 @@ int write_settings(pjsua_app_config *config, char *buf, pj_size_t max)
     unsigned i;
     pj_str_t cfg;
     char line[128];
-    extern pj_bool_t pjsip_use_compact_form;
 
     PJ_UNUSED_ARG(max);
 
@@ -1910,6 +2058,12 @@ int write_settings(pjsua_app_config *config, char *buf, pj_size_t max)
     {
 	pj_ansi_sprintf(line, "--srtp-secure %d\n",
 			app_config.cfg.srtp_secure_signaling);
+	pj_strcat2(&cfg, line);
+    }
+    if (app_config.srtp_keying >= 0 && app_config.srtp_keying <= 1)
+    {
+	pj_ansi_sprintf(line, "--srtp-keying %d\n",
+			app_config.srtp_keying);
 	pj_strcat2(&cfg, line);
     }
 #endif
@@ -2132,7 +2286,7 @@ int write_settings(pjsua_app_config *config, char *buf, pj_size_t max)
 	pj_strcat2(&cfg, "--norefersub\n");
     }
 
-    if (pjsip_use_compact_form)
+    if (pjsip_cfg()->endpt.use_compact_form)
     {
 	pj_strcat2(&cfg, "--use-compact-form\n");
     }

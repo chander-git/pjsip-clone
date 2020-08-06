@@ -26,6 +26,15 @@ using namespace pj;
   }
 #endif
 
+#ifdef SWIGCSHARP
+  %typemap(throws, canthrow=1) pj::Error {
+    SWIG_CSharpSetPendingException(SWIG_CSharpApplicationException, 
+    	(std::string("C++ pj::Error:\n") + $1.info(true).c_str()).c_str());
+    
+    return $null;
+  }
+#endif
+
 // Allow C++ exceptions to be handled in Java
 #ifdef SWIGJAVA
   %typemap(throws, throws="java.lang.Exception") pj::Error {
@@ -38,16 +47,32 @@ using namespace pj;
   // Force the Error Java class to extend java.lang.Exception
   %typemap(javabase) pj::Error "java.lang.Exception";
 
-  // Override getMessage()
   %typemap(javacode) pj::Error %{
+
+  // Override getMessage()
   public String getMessage() {
     return getTitle();
   }
+  
+  // Disable serialization (check ticket #1868)
+  private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+    throw new java.io.NotSerializableException("Check ticket #1868!");
+  }
+  private void readObject(java.io.ObjectInputStream in) throws java.io.IOException {
+    throw new java.io.NotSerializableException("Check ticket #1868!");
+  }
+
 %}
 #endif
 
 
 // Constants from PJSIP libraries
+
+#ifdef SWIGJAVA
+%include "enumtypeunsafe.swg"
+%javaconst(1);
+#endif
+
 %include "symbols.i"
 
 
@@ -60,6 +85,7 @@ using namespace pj;
 %feature("director") Call;
 %feature("director") Buddy;
 %feature("director") FindBuddyMatch;
+%feature("director") AudioMediaPlayer;
 
 //
 // STL stuff.
@@ -76,6 +102,9 @@ using namespace pj;
 %ignore fromPj;
 %ignore toPj;
 
+%import "pj/config_site.h"
+%import "pjsua2/config.hpp"
+
 //
 // Now include the API itself.
 //
@@ -91,22 +120,57 @@ using namespace pj;
 
 %template(SipHeaderVector)		std::vector<pj::SipHeader>;
 %template(AuthCredInfoVector)		std::vector<pj::AuthCredInfo>;
+%template(SrtpCryptoVector)		std::vector<pj::SrtpCrypto>;
 %template(SipMultipartPartVector)	std::vector<pj::SipMultipartPart>;
 %template(BuddyVector)			std::vector<pj::Buddy*>;
+%template(BuddyVector2)			std::vector<pj::Buddy>;
 %template(AudioMediaVector)		std::vector<pj::AudioMedia*>;
+%template(AudioMediaVector2)		std::vector<pj::AudioMedia>;
+%template(VideoMediaVector)		std::vector<pj::VideoMedia>;
 %template(ToneDescVector)		std::vector<pj::ToneDesc>;
 %template(ToneDigitVector)		std::vector<pj::ToneDigit>;
 %template(ToneDigitMapVector)	        std::vector<pj::ToneDigitMapDigit>;
-%template(MediaFormatVector)		std::vector<pj::MediaFormat*>;
 %template(AudioDevInfoVector)		std::vector<pj::AudioDevInfo*>;
+%template(AudioDevInfoVector2)		std::vector<pj::AudioDevInfo>;
 %template(CodecInfoVector)		std::vector<pj::CodecInfo*>;
+%template(CodecInfoVector2)		std::vector<pj::CodecInfo>;
+%template(VideoDevInfoVector)		std::vector<pj::VideoDevInfo*>;
+%template(VideoDevInfoVector2)		std::vector<pj::VideoDevInfo>;
+%template(CodecFmtpVector)		std::vector<pj::CodecFmtp>;	
+%template(MediaFormatAudioVector)       std::vector<pj::MediaFormatAudio>;
+%template(MediaFormatVideoVector)       std::vector<pj::MediaFormatVideo>;
+%template(CallMediaInfoVector)          std::vector<pj::CallMediaInfo>;
+%template(RtcpFbCapVector)              std::vector<pj::RtcpFbCap>;
+%template(SslCertNameVector)            std::vector<pj::SslCertName>;
+
+%ignore pj::WindowHandle::display;
+%ignore pj::WindowHandle::window;
+
+/* pj::WindowHandle::setWindow() receives Surface object */
+#if defined(SWIGJAVA) && defined(__ANDROID__)
+%{
+#if defined(PJMEDIA_HAS_VIDEO) && PJMEDIA_HAS_VIDEO!=0
+#  include <android/native_window_jni.h>
+#else
+#  define ANativeWindow_fromSurface(a,b) NULL
+#endif
+%}
+%typemap(in) jobject surface {
+    $1 = ($input? (jobject)ANativeWindow_fromSurface(jenv, $input): NULL);
+}
+%extend pj::WindowHandle {
+    void setWindow(jobject surface) { $self->window = surface; }
+}
+#else
+%extend pj::WindowHandle {
+    void setWindow(long long hwnd) { $self->window = (void*)hwnd; }
+}
+#endif
 
 %include "pjsua2/media.hpp"
 %include "pjsua2/presence.hpp"
 %include "pjsua2/account.hpp"
 %include "pjsua2/call.hpp"
-
-%template(CallMediaInfoVector)          std::vector<pj::CallMediaInfo>;
 
 %ignore pj::JsonDocument::allocElement;
 %ignore pj::JsonDocument::getPool;

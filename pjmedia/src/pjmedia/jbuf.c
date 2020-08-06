@@ -46,6 +46,14 @@
 #define INIT_CYCLE		10
 
 
+/* Maximum frame index in JB framelist (estimated).
+ * As index is calculated as (RTP-timestamp/timestamp-span), the maximum index
+ * usually ranging from MAXUINT32/9000 (10 fps video at 90kHz) to MAXUINT32/80
+ * (10 ms audio at 8000Hz), lets take the 'lowest'.
+ */
+#define MAX_FRAME_INDEX		(0xFFFFFFFF/9000)
+
+
 /* Minimal difference between JB size and 2*burst-level to perform
  * JB shrinking in static discard algorithm.
  */
@@ -295,14 +303,25 @@ static pj_bool_t jb_framelist_get(jb_framelist_t *framelist,
 		if (bit_info)
 		    *bit_info = 0;
 	    } else {
+		pj_size_t frm_size = framelist->content_len[framelist->head];
+		pj_size_t max_size = size? *size : frm_size;
+		pj_size_t copy_size = PJ_MIN(max_size, frm_size);
+
+		/* Buffer size should not be smaller than frame size. */
+		if (max_size < frm_size) {
+		    pj_assert(!"Buffer too small");
+		    PJ_LOG(4, (THIS_FILE, "Warning: buffer too small for the "
+					  "retrieved frame!"));
+		}
+
 		pj_memcpy(frame,
 			  framelist->content +
 			  framelist->head * framelist->frame_size,
-			  framelist->frame_size);
+			  copy_size);
 		*p_type = (pjmedia_jb_frame_type)
 			  framelist->frame_type[framelist->head];
 		if (size)
-		    *size   = framelist->content_len[framelist->head];
+		    *size = copy_size;
 		if (bit_info)
 		    *bit_info = framelist->bit_info[framelist->head];
 	    }
@@ -459,35 +478,56 @@ static pj_status_t jb_framelist_put_at(jb_framelist_t *framelist,
 
     PJ_ASSERT_RETURN(frame_size <= framelist->frame_size, PJ_EINVAL);
 
-    /* too late or sequence restart */
-    if (index < framelist->origin) {
+    /* get distance of this frame to the first frame in the buffer */
+    distance = index - framelist->origin;
+
+    /* too late or sequence restart or far jump */
+    if (distance < 0) {
 	if (framelist->origin - index < MAX_MISORDER) {
 	    /* too late */
+	    TRACE__((THIS_FILE,"Put frame #%d: too late (distance=%d)",
+			       index, distance));
 	    return PJ_ETOOSMALL;
-	} else {
+	} else if (framelist->origin + framelist->size >= MAX_FRAME_INDEX) {
 	    /* sequence restart */
+	    TRACE__((THIS_FILE,"Put frame #%d: sequence restart (distance=%d, "
+			       "orig=%d, size=%d)",
+			       index, distance, framelist->origin,
+			       framelist->size));
 	    framelist->origin = index - framelist->size;
+	    distance = framelist->size;
+	} else {
+	    /* jump too far, reset the buffer */
+	    TRACE__((THIS_FILE,"Put frame #%d: far jump (distance=%d)",
+			       index, distance));
+	    jb_framelist_reset(framelist);
+	    framelist->origin = index;
+	    distance = 0;
 	}
     }
 
     /* if jbuf is empty, just reset the origin */
     if (framelist->size == 0) {
 	pj_assert(framelist->discarded_num == 0);
+	TRACE__((THIS_FILE,"Put frame #%d: origin reset (from %d) as JB empty",
+			   index, framelist->origin));
 	framelist->origin = index;
+	distance = 0;
     }
-
-    /* get distance of this frame to the first frame in the buffer */
-    distance = index - framelist->origin;
 
     /* far jump, the distance is greater than buffer capacity */
     if (distance >= (int)framelist->max_count) {
 	if (distance > MAX_DROPOUT) {
 	    /* jump too far, reset the buffer */
+	    TRACE__((THIS_FILE,"Put frame #%d: far jump (distance=%d)",
+			       index, distance));
 	    jb_framelist_reset(framelist);
 	    framelist->origin = index;
 	    distance = 0;
 	} else {
 	    /* otherwise, reject the frame */
+	    TRACE__((THIS_FILE,"Put frame #%d: rejected due to JB full",
+			       index));
 	    return PJ_ETOOMANY;
 	}
     }
@@ -496,8 +536,10 @@ static pj_status_t jb_framelist_put_at(jb_framelist_t *framelist,
     pos = (framelist->head + distance) % framelist->max_count;
 
     /* if the slot is occupied, it must be duplicated frame, ignore it. */
-    if (framelist->frame_type[pos] != PJMEDIA_JB_MISSING_FRAME)
+    if (framelist->frame_type[pos] != PJMEDIA_JB_MISSING_FRAME) {
+	TRACE__((THIS_FILE,"Put frame #%d maybe a duplicate, ignored", index));
 	return PJ_EEXISTS;
+    }
 
     /* put the frame into the slot */
     framelist->frame_type[pos] = frame_type;
@@ -581,6 +623,20 @@ PJ_DEF(pj_status_t) pjmedia_jbuf_create(pj_pool_t *pool,
     pjmedia_jbuf_reset(jb);
 
     *p_jb = jb;
+    return PJ_SUCCESS;
+}
+
+
+PJ_DEF(pj_status_t) pjmedia_jbuf_set_ptime( pjmedia_jbuf *jb,
+					    unsigned ptime)
+{
+    PJ_ASSERT_RETURN(jb, PJ_EINVAL);
+
+    jb->jb_frame_ptime    = ptime;
+    jb->jb_min_shrink_gap = PJMEDIA_JBUF_DISC_MIN_GAP / ptime;
+    jb->jb_max_burst	  = PJ_MAX(MAX_BURST_MSEC / ptime,
+    				   jb->jb_max_count*3/4);
+
     return PJ_SUCCESS;
 }
 
@@ -973,6 +1029,12 @@ PJ_DEF(void) pjmedia_jbuf_put_frame3(pjmedia_jbuf *jb,
 
     cur_size = jb_framelist_eff_size(&jb->jb_framelist);
 
+    /* Check if frame size is larger than JB frame size */
+    if (frame_size > jb->jb_frame_size) {
+	PJ_LOG(4, (THIS_FILE, "Warning: frame too large for jitter buffer, "
+		   "it will be truncated!"));
+    }
+
     /* Attempt to store the frame */
     min_frame_size = PJ_MIN(frame_size, jb->jb_frame_size);
     status = jb_framelist_put_at(&jb->jb_framelist, frame_seq, frame,
@@ -1129,6 +1191,7 @@ PJ_DEF(pj_status_t) pjmedia_jbuf_get_state( const pjmedia_jbuf *jb,
     state->frame_size = (unsigned)jb->jb_frame_size;
     state->min_prefetch = jb->jb_min_prefetch;
     state->max_prefetch = jb->jb_max_prefetch;
+    state->max_count = jb->jb_max_count;
 
     state->burst = jb->jb_eff_level;
     state->prefetch = jb->jb_prefetch;

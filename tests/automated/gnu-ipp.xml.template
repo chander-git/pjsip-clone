@@ -11,12 +11,14 @@ export CFLAGS += -Wno-unused-label -g
 		<FileWrite file="pjlib/include/pj/config_site.h">
 		  <![CDATA[
 /* Written by ccdash */
-#define PJ_HAS_IPV6		1
 #define PJMEDIA_HAS_G7221_CODEC 0
 #define PJMEDIA_HAS_INTEL_IPP	1
+#define PJMEDIA_SRTP_HAS_DTLS	1
+// There has to be a test with IPv6 disabled
+#define PJ_HAS_IPV6		0
 ]]>			
 		</FileWrite>
-		<Configure cmd='./aconfigure --enable-ipp --with-ipp="$(IPPROOT)" --with-ipp-samples="$(IPPSAMPLES)" --with-ipp-arch=$(IPPARCH)' />
+		<Configure cmd='make distclean &amp;&amp; ./aconfigure --enable-ipp --with-ipp="$(IPPROOT)" --with-ipp-samples="$(IPPSAMPLES)" --with-ipp-arch=$(IPPARCH) --with-ssl=/Users/pjsip/Desktop/opt' />
 		<Build cmd="make dep &amp;&amp; make clean &amp;&amp; make" />
 		<Test name="pjlib-test" wdir="pjlib/bin" cmd="./pjlib-test-$(SUFFIX)" disabled=$(NOTEST) />
 		<Test name="pjlib-util-test" wdir="pjlib-util/bin" cmd="./pjlib-util-test-$(SUFFIX)" disabled=$(NOTEST) />

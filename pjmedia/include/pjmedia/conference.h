@@ -43,6 +43,14 @@
 
 PJ_BEGIN_DECL
 
+/* Since 1.3 pjmedia_conf_add_passive_port() has been deprecated
+ * and replaced by splitcomb.
+ * See also https://trac.pjsip.org/repos/ticket/2234.
+ */
+#ifndef DEPRECATED_FOR_TICKET_2234
+#  define DEPRECATED_FOR_TICKET_2234	1
+#endif
+
 /**
  * The conference bridge signature in pjmedia_port_info.
  */
@@ -71,6 +79,8 @@ typedef struct pjmedia_conf_port_info
     pjmedia_port_op	rx_setting;	    /**< Receive settings.	    */
     unsigned		listener_cnt;	    /**< Number of listeners.	    */
     unsigned	       *listener_slots;	    /**< Array of listeners.	    */
+    unsigned	       *listener_adj_level; /**< Array of listeners' level
+    						 adjustment		    */
     unsigned		transmitter_cnt;    /**< Number of transmitter.	    */
     unsigned		clock_rate;	    /**< Clock rate of the port.    */
     unsigned		channel_count;	    /**< Number of channels.	    */
@@ -235,6 +245,7 @@ PJ_DECL(pj_status_t) pjmedia_conf_add_port( pjmedia_conf *conf,
 					    unsigned *p_slot );
 
 
+#if !DEPRECATED_FOR_TICKET_2234
 /**
  * <i><b>Warning:</b> This API has been deprecated since 1.3 and will be
  * removed in the future release, use @ref PJMEDIA_SPLITCOMB instead.</i>
@@ -277,6 +288,7 @@ PJ_DECL(pj_status_t) pjmedia_conf_add_passive_port( pjmedia_conf *conf,
 						    unsigned *p_slot,
 						    pjmedia_port **p_port );
 
+#endif
 
 /**
  * Change TX and RX settings for the port.
@@ -295,23 +307,42 @@ PJ_DECL(pj_status_t) pjmedia_conf_configure_port( pjmedia_conf *conf,
 
 
 /**
- * Enable unidirectional audio from the specified source slot to the
- * specified sink slot.
+ * Enable unidirectional audio from the specified source slot to the specified
+ * sink slot.
+ * Application may adjust the level to make signal transmitted from the source
+ * slot to the sink slot either louder or more quiet. The level adjustment is
+ * calculated with this formula:
+ * <b><tt>output = input * (adj_level+128) / 128</tt></b>. Using this, zero
+ * indicates no adjustment, the value -128 will mute the signal, and the value
+ * of +128 will make the signal 100% louder, +256 will make it 200% louder,
+ * etc.
+ *
+ * The level adjustment will apply to a specific connection only (i.e. only
+ * for the signal from the source to the sink), as compared to
+ * pjmedia_conf_adjust_tx_level()/pjmedia_conf_adjust_rx_level() which
+ * applies to all signals from/to that port. The signal adjustment
+ * will be cumulative, in this following order:
+ * signal from the source will be adjusted with the level specified
+ * in pjmedia_conf_adjust_rx_level(), then with the level specified
+ * via this API, and finally with the level specified to the sink's
+ * pjmedia_conf_adjust_tx_level(). 
  *
  * @param conf		The conference bridge.
  * @param src_slot	Source slot.
  * @param sink_slot	Sink slot.
- * @param level		This argument is reserved for future improvements
- *			where it is possible to adjust the level of signal
- *			transmitted in a specific connection. For now,
- *			this argument MUST be zero.
+ * @param adj_level	Adjustment level, which must be greater than or equal
+ *			to -128. A value of zero means there is no level
+ *			adjustment to be made, the value -128 will mute the
+ *			signal, and the value of +128 will make the signal
+ *			100% louder, +256 will make it 200% louder, etc.
+ *			See the function description for the formula.
  *
  * @return		PJ_SUCCES on success.
  */
 PJ_DECL(pj_status_t) pjmedia_conf_connect_port( pjmedia_conf *conf,
 						unsigned src_slot,
 						unsigned sink_slot,
-						int level );
+						int adj_level );
 
 
 /**
@@ -494,6 +525,40 @@ PJ_DECL(pj_status_t) pjmedia_conf_adjust_rx_level( pjmedia_conf *conf,
 PJ_DECL(pj_status_t) pjmedia_conf_adjust_tx_level( pjmedia_conf *conf,
 						   unsigned slot,
 						   int adj_level );
+
+
+/**
+ * Adjust the level of signal to be transmitted from the source slot to the
+ * sink slot.
+ * Application may adjust the level to make signal transmitted from the source
+ * slot to the sink slot either louder or more quiet. The level adjustment is
+ * calculated with this formula:
+ * <b><tt>output = input * (adj_level+128) / 128</tt></b>. Using this, zero
+ * indicates no adjustment, the value -128 will mute the signal, and the value
+ * of +128 will make the signal 100% louder, +256 will make it 200% louder,
+ * etc.
+ *
+ * The level adjustment value will stay with the connection until the
+ * connection is removed or new adjustment value is set. The current level
+ * adjustment value is reported in the media port info when the
+ * #pjmedia_conf_get_port_info() function is called.
+ *
+ * @param conf		The conference bridge.
+ * @param src_slot	Source slot.
+ * @param sink_slot	Sink slot.
+ * @param adj_level	Adjustment level, which must be greater than or equal
+ *			to -128. A value of zero means there is no level
+ *			adjustment to be made, the value -128 will mute the 
+ *			signal, and the value of +128 will make the signal 
+ *			100% louder, +256 will make it 200% louder, etc. 
+ *			See the function description for the formula.
+ *
+ * @return		PJ_SUCCESS on success.
+ */
+PJ_DECL(pj_status_t) pjmedia_conf_adjust_conn_level( pjmedia_conf *conf,
+						     unsigned src_slot,
+						     unsigned sink_slot,
+						     int adj_level );
 
 
 

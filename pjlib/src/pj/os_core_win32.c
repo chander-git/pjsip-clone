@@ -30,12 +30,16 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#if defined(PJ_HAS_WINSOCK2_H) && PJ_HAS_WINSOCK2_H != 0
+#  include <winsock2.h>
+#endif
+
 #if defined(PJ_HAS_WINSOCK_H) && PJ_HAS_WINSOCK_H != 0
 #  include <winsock.h>
 #endif
 
-#if defined(PJ_HAS_WINSOCK2_H) && PJ_HAS_WINSOCK2_H != 0
-#  include <winsock2.h>
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+#   include "../../../third_party/threademulation/include/ThreadEmulation.h"
 #endif
 
 /* Activate mutex related logging if PJ_DEBUG_MUTEX is set, otherwise
@@ -297,7 +301,12 @@ PJ_DEF(pj_bool_t) pj_thread_is_registered(void)
  */
 PJ_DEF(int) pj_thread_get_prio(pj_thread_t *thread)
 {
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    PJ_UNUSED_ARG(thread);
+    return -1;
+#else
     return GetThreadPriority(thread->hthread);
+#endif
 }
 
 
@@ -312,7 +321,11 @@ PJ_DEF(pj_status_t) pj_thread_set_prio(pj_thread_t *thread,  int prio)
 			prio<=THREAD_PRIORITY_TIME_CRITICAL,
 		     PJ_EINVAL);
 
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    if (SetThreadPriorityRT(thread->hthread, prio) == FALSE)
+#else
     if (SetThreadPriority(thread->hthread, prio) == FALSE)
+#endif
 	return PJ_RETURN_OS_ERROR(GetLastError());
 
     return PJ_SUCCESS;
@@ -473,6 +486,10 @@ PJ_DEF(pj_status_t) pj_thread_create( pj_pool_t *pool,
     DWORD dwflags = 0;
     pj_thread_t *rec;
 
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    PJ_UNUSED_ARG(stack_size);
+#endif
+
     PJ_CHECK_STACK();
     PJ_ASSERT_RETURN(pool && proc && thread_ptr, PJ_EINVAL);
 
@@ -506,9 +523,17 @@ PJ_DEF(pj_status_t) pj_thread_create( pj_pool_t *pool,
     /* Create the thread. */
     rec->proc = proc;
     rec->arg = arg;
-    rec->hthread = CreateThread(NULL, stack_size, 
-				thread_main, rec,
-				dwflags, &rec->idthread);
+
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    rec->hthread = CreateThreadRT(NULL, 0,
+				  thread_main, rec,
+				  dwflags, NULL);
+#else
+    rec->hthread = CreateThread(NULL, stack_size,
+			        thread_main, rec,
+			        dwflags, &rec->idthread);
+#endif
+
     if (rec->hthread == NULL)
 	return PJ_RETURN_OS_ERROR(GetLastError());
 
@@ -540,7 +565,11 @@ PJ_DEF(pj_status_t) pj_thread_resume(pj_thread_t *p)
     PJ_CHECK_STACK();
     PJ_ASSERT_RETURN(p, PJ_EINVAL);
 
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    if (ResumeThreadRT(rec->hthread) == (DWORD)-1)
+#else
     if (ResumeThread(rec->hthread) == (DWORD)-1)
+#endif    
         return PJ_RETURN_OS_ERROR(GetLastError());
     else
         return PJ_SUCCESS;
@@ -584,7 +613,11 @@ PJ_DEF(pj_status_t) pj_thread_join(pj_thread_t *p)
 
     PJ_LOG(6, (pj_thread_this()->obj_name, "Joining thread %s", p->obj_name));
 
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    rc = WaitForSingleObjectEx(rec->hthread, INFINITE, FALSE);
+#else
     rc = WaitForSingleObject(rec->hthread, INFINITE);
+#endif    
 
     if (rc==WAIT_OBJECT_0)
         return PJ_SUCCESS;
@@ -616,7 +649,13 @@ PJ_DEF(pj_status_t) pj_thread_destroy(pj_thread_t *p)
 PJ_DEF(pj_status_t) pj_thread_sleep(unsigned msec)
 {
     PJ_CHECK_STACK();
+
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    SleepRT(msec);
+#else
     Sleep(msec);
+#endif
+
     return PJ_SUCCESS;
 }
 
@@ -711,6 +750,7 @@ PJ_DEF(pj_status_t) pj_atomic_destroy( pj_atomic_t *var )
 PJ_DEF(void) pj_atomic_set( pj_atomic_t *atomic_var, pj_atomic_value_t value)
 {
     PJ_CHECK_STACK();
+    PJ_ASSERT_ON_FAIL(atomic_var, return);
 
     InterlockedExchange(&atomic_var->value, value);
 }
@@ -745,6 +785,7 @@ PJ_DEF(pj_atomic_value_t) pj_atomic_inc_and_get(pj_atomic_t *atomic_var)
  */
 PJ_DEF(void) pj_atomic_inc(pj_atomic_t *atomic_var)
 {
+    PJ_ASSERT_ON_FAIL(atomic_var, return);
     pj_atomic_inc_and_get(atomic_var);
 }
 
@@ -767,6 +808,7 @@ PJ_DEF(pj_atomic_value_t) pj_atomic_dec_and_get(pj_atomic_t *atomic_var)
  */
 PJ_DEF(void) pj_atomic_dec(pj_atomic_t *atomic_var)
 {
+    PJ_ASSERT_ON_FAIL(atomic_var, return);
     pj_atomic_dec_and_get(atomic_var);
 }
 
@@ -776,6 +818,7 @@ PJ_DEF(void) pj_atomic_dec(pj_atomic_t *atomic_var)
 PJ_DEF(void) pj_atomic_add( pj_atomic_t *atomic_var,
 			    pj_atomic_value_t value )
 {
+    PJ_ASSERT_ON_FAIL(atomic_var, return);
 #if defined(PJ_WIN32_WINNT) && PJ_WIN32_WINNT >= 0x0400
     InterlockedExchangeAdd( &atomic_var->value, value );
 #else
@@ -810,7 +853,11 @@ PJ_DEF(pj_status_t) pj_thread_local_alloc(long *index)
     //beginning before main thread is initialized.
     //PJ_CHECK_STACK();
 
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    *index = TlsAllocRT();
+#else
     *index = TlsAlloc();
+#endif
 
     if (*index == TLS_OUT_OF_INDEXES)
         return PJ_RETURN_OS_ERROR(GetLastError());
@@ -824,7 +871,11 @@ PJ_DEF(pj_status_t) pj_thread_local_alloc(long *index)
 PJ_DEF(void) pj_thread_local_free(long index)
 {
     PJ_CHECK_STACK();
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    TlsFreeRT(index);
+#else
     TlsFree(index);
+#endif    
 }
 
 /*
@@ -837,7 +888,13 @@ PJ_DEF(pj_status_t) pj_thread_local_set(long index, void *value)
     //Can't check stack because this function is called in the
     //beginning before main thread is initialized.
     //PJ_CHECK_STACK();
+
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    rc = TlsSetValueRT(index, value);
+#else
     rc = TlsSetValue(index, value);
+#endif
+    
     return rc!=0 ? PJ_SUCCESS : PJ_RETURN_OS_ERROR(GetLastError());
 }
 
@@ -849,7 +906,11 @@ PJ_DEF(void*) pj_thread_local_get(long index)
     //Can't check stack because this function is called
     //by PJ_CHECK_STACK() itself!!!
     //PJ_CHECK_STACK();
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    return TlsGetValueRT(index);
+#else
     return TlsGetValue(index);
+#endif
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -858,7 +919,9 @@ static pj_status_t init_mutex(pj_mutex_t *mutex, const char *name)
 
     PJ_CHECK_STACK();
 
-#if PJ_WIN32_WINNT >= 0x0400
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    InitializeCriticalSectionEx(&mutex->crit, 0, 0);
+#elif PJ_WIN32_WINNT >= 0x0400
     InitializeCriticalSection(&mutex->crit);
 #else
     mutex->hMutex = CreateMutex(NULL, FALSE, NULL);
@@ -1112,7 +1175,15 @@ PJ_DEF(pj_status_t) pj_sem_create( pj_pool_t *pool,
     PJ_ASSERT_RETURN(pool && sem_ptr, PJ_EINVAL);
 
     sem = pj_pool_alloc(pool, sizeof(*sem));    
+
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    /** SEMAPHORE_ALL_ACCESS **/
+    sem->hSemaphore = CreateSemaphoreEx(NULL, initial, max, NULL, 0,
+					SEMAPHORE_ALL_ACCESS);
+#else
     sem->hSemaphore = CreateSemaphore(NULL, initial, max, NULL);
+#endif
+    
     if (!sem->hSemaphore)
 	return PJ_RETURN_OS_ERROR(GetLastError());
 
@@ -1142,8 +1213,13 @@ static pj_status_t pj_sem_wait_for(pj_sem_t *sem, unsigned timeout)
 
     LOG_MUTEX((sem->obj_name, "Semaphore: thread %s is waiting", 
 			      pj_thread_this()->obj_name));
-
+    
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    result = WaitForSingleObjectEx(sem->hSemaphore, timeout, FALSE);
+#else
     result = WaitForSingleObject(sem->hSemaphore, timeout);
+#endif
+
     if (result == WAIT_OBJECT_0) {
 	LOG_MUTEX((sem->obj_name, "Semaphore acquired by thread %s", 
 				  pj_thread_this()->obj_name));
@@ -1240,8 +1316,14 @@ PJ_DEF(pj_status_t) pj_event_create( pj_pool_t *pool,
     if (!event)
         return PJ_ENOMEM;
 
-    event->hEvent = CreateEvent(NULL, manual_reset?TRUE:FALSE, 
-				initial?TRUE:FALSE, NULL);
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    event->hEvent = CreateEventEx(NULL, NULL,
+				 (manual_reset? 0x1:0x0) | (initial? 0x2:0x0),
+				 EVENT_ALL_ACCESS);
+#else
+    event->hEvent = CreateEvent(NULL, manual_reset ? TRUE : FALSE,
+			        initial ? TRUE : FALSE, NULL);
+#endif
 
     if (!event->hEvent)
 	return PJ_RETURN_OS_ERROR(GetLastError());
@@ -1273,7 +1355,12 @@ static pj_status_t pj_event_wait_for(pj_event_t *event, unsigned timeout)
     PJ_LOG(6, (event->obj_name, "Event: thread %s is waiting", 
 			        pj_thread_this()->obj_name));
 
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    result = WaitForSingleObjectEx(event->hEvent, timeout, FALSE);
+#else
     result = WaitForSingleObject(event->hEvent, timeout);
+#endif
+
     if (result == WAIT_OBJECT_0) {
 	PJ_LOG(6, (event->obj_name, "Event: thread %s is released", 
 				    pj_thread_this()->obj_name));
@@ -1331,15 +1418,21 @@ PJ_DEF(pj_status_t) pj_event_set(pj_event_t *event)
  */
 PJ_DEF(pj_status_t) pj_event_pulse(pj_event_t *event)
 {
+#if defined(PJ_WIN32_WINPHONE8) && PJ_WIN32_WINPHONE8
+    PJ_UNUSED_ARG(event);
+    pj_assert(!"pj_event_pulse() not supported!");
+    return PJ_ENOTSUP;
+#else
     PJ_CHECK_STACK();
     PJ_ASSERT_RETURN(event, PJ_EINVAL);
 
     PJ_LOG(6, (event->obj_name, "Pulsing event"));
 
     if (PulseEvent(event->hEvent))
-        return PJ_SUCCESS;
+	return PJ_SUCCESS;
     else
-        return PJ_RETURN_OS_ERROR(GetLastError());
+	return PJ_RETURN_OS_ERROR(GetLastError());
+#endif
 }
 
 /*

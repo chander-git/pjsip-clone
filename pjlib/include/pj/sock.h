@@ -26,6 +26,7 @@
  */
 
 #include <pj/types.h>
+#include <pj/compat/socket.h>
 
 PJ_BEGIN_DECL 
 
@@ -276,6 +277,19 @@ extern const pj_uint16_t PJ_IPTOS_MINCOST;
 #endif
 
 
+/** IPV6_TCLASS optname in setsockopt(). @see pj_IPV6_TCLASS() */
+extern const pj_uint16_t PJ_IPV6_TCLASS;
+
+
+#if defined(PJ_DLL)
+    /** Get #PJ_IPV6_TCLASS constant */
+    PJ_DECL(int) pj_IPV6_TCLASS(void);
+#else
+    /** Get #PJ_IPV6_TCLASS constant */
+#   define pj_IPV6_TCLASS()	PJ_IPV6_TCLASS
+#endif
+
+
 /**
  * Values to be specified as \c optname when calling #pj_sock_setsockopt() 
  * or #pj_sock_getsockopt().
@@ -471,6 +485,11 @@ typedef enum pj_socket_sd_type
  */
 #define PJ_INVALID_SOCKET   (-1)
 
+/* Undefining UNIX standard library macro such as s_addr is not
+ * recommended as it may cause build issues for anyone who uses
+ * the macro. See #2311 for more details.
+ */
+#if 0
 /* Must undefine s_addr because of pj_in_addr below */
 #undef s_addr
 
@@ -482,6 +501,9 @@ typedef struct pj_in_addr
     pj_uint32_t	s_addr;		/**< The 32bit IP address.	    */
 } pj_in_addr;
 
+#else
+typedef struct in_addr pj_in_addr;
+#endif
 
 /**
  * Maximum length of text representation of an IPv4 address.
@@ -519,10 +541,15 @@ struct pj_sockaddr_in
 #endif
     pj_uint16_t	sin_port;	/**< Transport layer port number.   */
     pj_in_addr	sin_addr;	/**< IP address.		    */
-    char	sin_zero[PJ_SOCKADDR_IN_SIN_ZERO_LEN]; /**< Padding.*/
+    char	sin_zero_pad[PJ_SOCKADDR_IN_SIN_ZERO_LEN]; /**< Padding.*/
 };
 
 
+/* Undefining C standard library macro such as s6_addr is not
+ * recommended as it may cause build issues for anyone who uses
+ * the macro. See #2311 for more details.
+ */
+#if 0
 #undef s6_addr
 
 /**
@@ -547,6 +574,9 @@ typedef union pj_in6_addr
 #endif
 
 } pj_in6_addr;
+#else
+typedef struct in6_addr pj_in6_addr;
+#endif
 
 
 /** Initializer value for pj_in6_addr. */
@@ -616,8 +646,6 @@ typedef struct pj_ip_mreq {
     pj_in_addr imr_interface;	/**< local IP address of interface. */
 } pj_ip_mreq;
 
-/* Maximum number of socket options. */
-#define PJ_MAX_SOCKOPT_PARAMS 4
 
 /**
  * Options to be set for the socket. 
@@ -701,7 +729,7 @@ PJ_DECL(char*) pj_inet_ntoa(pj_in_addr inaddr);
  *
  * @return	nonzero if the address is valid, zero if not.
  */
-PJ_DECL(int) pj_inet_aton(const pj_str_t *cp, struct pj_in_addr *inp);
+PJ_DECL(int) pj_inet_aton(const pj_str_t *cp, pj_in_addr *inp);
 
 /**
  * This function converts an address in its standard text presentation form
@@ -919,6 +947,24 @@ PJ_DECL(void) pj_sockaddr_copy_addr(pj_sockaddr *dst,
  * @see @pj_sockaddr_copy_addr()
  */
 PJ_DECL(void) pj_sockaddr_cp(pj_sockaddr_t *dst, const pj_sockaddr_t *src);
+
+/*
+ * If the source's and desired address family matches, copy the address,
+ * otherwise synthesize a new address with the desired address family,
+ * from the source address. This can be useful to generate an IPv4-mapped
+ * IPv6 address.
+ *
+ * @param dst_af    Desired address family.
+ * @param dst	    Destination socket address, invalid if synthesis is
+ *		    required and failed.
+ * @param src	    Source socket address.
+ *
+ * @return	    PJ_SUCCESS on success, or the error status
+ *		    if synthesis is required and failed.
+ */
+PJ_DECL(pj_status_t) pj_sockaddr_synthesize(int dst_af,
+				            pj_sockaddr_t *dst,
+				            const pj_sockaddr_t *src);
 
 /**
  * Get the IP address of an IPv4 socket address.
@@ -1457,6 +1503,30 @@ PJ_DECL(pj_status_t) pj_sock_sendto(pj_sock_t sockfd,
 PJ_DECL(pj_status_t) pj_sock_shutdown( pj_sock_t sockfd,
 				       int how);
 #endif
+
+/*****************************************************************************
+ *
+ * Utilities.
+ *
+ *****************************************************************************
+ */
+
+/**
+ * Print socket address string. This method will enclose the address string 
+ * with square bracket if it's IPv6 address.
+ *
+ * @param host_str  The host address string.
+ * @param port	    The port address.
+ * @param buf	    Text buffer.
+ * @param size	    Size of buffer.
+ * @param flags	    Bitmask combination of these value:
+ *		    - 1: port number is included. 
+ *
+ * @return	The address string.
+ */
+PJ_DECL(char *) pj_addr_str_print( const pj_str_t *host_str, int port, 
+				   char *buf, int size, unsigned flag);
+
 
 /**
  * @}

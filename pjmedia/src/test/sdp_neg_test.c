@@ -661,7 +661,11 @@ static struct test
 	    NULL,
 	    /* This is how Bob's answer should look like: */
 	    "v=0\r\n"
+#if PJMEDIA_SDP_NEG_COMPARE_BEFORE_INC_VERSION
+	    "o=bob 2808844564 2808844564 IN IP4 host.biloxi.example.com\r\n"
+#else
 	    "o=bob 2808844564 2808844565 IN IP4 host.biloxi.example.com\r\n"
+#endif
 	    "s=bob\r\n"
 	    "c=IN IP4 host.biloxi.example.com\r\n"
 	    "t=0 0\r\n"
@@ -1236,6 +1240,90 @@ static struct test
 	    //"a=rtpmap:0 PCMU/8000\r\n"      /* <-- this is not necessary (port 0) */
 	    "m=video 5000 RTP/AVP 31\r\n"
 	    "a=rtpmap:31 H261/90000\r\n"
+	    "",
+	  }
+	}
+    },
+
+    /* test 17: */
+    {
+	/*********************************************************************
+	 * Ticket #2088: : Handle multiple telephone-event formats.
+	 */
+
+	"Ticket #2088: Handle multiple telephone-event formats",
+	2,
+	{
+	  {
+	    REMOTE_OFFER,
+	    /* Bob sends offer: */
+	    "v=0\r\n"
+	    "o=bob 2808844564 2808844563 IN IP4 host.biloxi.example.com\r\n"
+	    "s=bob\r\n"
+	    "c=IN IP4 host.biloxi.example.com\r\n"
+	    "t=0 0\r\n"
+	    "m=audio 3000 RTP/AVP 97 0 98 99\r\n"
+	    "a=rtpmap:97 Speex/16000\r\n"
+	    "a=rtpmap:0 PCMU/8000\r\n"
+	    "a=rtpmap:98 telephone-event/8000\r\n"
+	    "a=rtpmap:99 telephone-event/16000\r\n"
+	    "",
+	    /* Alice initial capability: */
+	    "v=0\r\n"
+	    "o=alice 2890844526 2890844526 IN IP4 host.atlanta.example.com\r\n"
+	    "s=alice\r\n"
+	    "c=IN IP4 host.atlanta.example.com\r\n"
+	    "t=0 0\r\n"
+	    "m=audio 4000 RTP/AVP 0 100 96 98\r\n"
+	    "a=rtpmap:0 PCMU/8000\r\n"
+	    "a=rtpmap:100 Speex/16000\r\n"
+	    "a=rtpmap:96 telephone-event/8000\r\n"
+	    "a=rtpmap:98 telephone-event/16000\r\n"
+	    "",
+	    /* Alice's local SDP should be: */
+	    "v=0\r\n"
+	    "o=alice 2890844526 2890844527 IN IP4 host.atlanta.example.com\r\n"
+	    "s=alice\r\n"
+	    "c=IN IP4 host.atlanta.example.com\r\n"
+	    "t=0 0\r\n"
+	    "m=audio 4000 RTP/AVP 97 99\r\n"
+	    "a=rtpmap:97 Speex/16000\r\n"
+	    "a=rtpmap:99 telephone-event/16000\r\n"
+	    "",
+	  },
+	  {
+	    LOCAL_OFFER,
+	    /* Alice updates offer */
+	    "v=0\r\n"
+	    "o=alice 2890844526 2890844528 IN IP4 host.atlanta.example.com\r\n"
+	    "s=alice\r\n"
+	    "c=IN IP4 host.atlanta.example.com\r\n"
+	    "t=0 0\r\n"
+	    "m=audio 4000 RTP/AVP 0 97 98 99\r\n"
+	    "a=rtpmap:0 PCMU/8000\r\n"
+	    "a=rtpmap:97 Speex/16000\r\n"
+	    "a=rtpmap:98 telephone-event/8000\r\n"
+	    "a=rtpmap:99 telephone-event/16000\r\n"
+	    "",
+	    /* Receive Bob's answer: */
+	    "v=0\r\n"
+	    "o=bob 2808844564 2808844563 IN IP4 host.biloxi.example.com\r\n"
+	    "s=bob\r\n"
+	    "c=IN IP4 host.biloxi.example.com\r\n"
+	    "t=0 0\r\n"
+	    "m=audio 3000 RTP/AVP 99 100\r\n"
+	    "a=rtpmap:99 Speex/16000\r\n"
+	    "a=rtpmap:100 telephone-event/16000\r\n"
+	    "",
+	    /* Alice's local SDP should be: */
+	    "v=0\r\n"
+	    "o=alice 2890844526 2890844528 IN IP4 host.atlanta.example.com\r\n"
+	    "s=alice\r\n"
+	    "c=IN IP4 host.atlanta.example.com\r\n"
+	    "t=0 0\r\n"
+	    "m=audio 4000 RTP/AVP 97 99\r\n"
+	    "a=rtpmap:97 Speex/16000\r\n"
+	    "a=rtpmap:99 telephone-event/16000\r\n"
 	    "",
 	  }
 	}

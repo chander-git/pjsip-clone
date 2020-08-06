@@ -79,6 +79,8 @@ struct ec_operations
     pj_status_t (*ec_capture)(void *state,
 			     pj_int16_t *rec_frm,
 			     unsigned options );
+    pj_status_t	(*ec_get_stat)(void *state,
+    			     pjmedia_echo_stat *stat);
 };
 
 
@@ -88,7 +90,10 @@ static struct ec_operations echo_supp_op =
     &echo_supp_create,
     &echo_supp_destroy,
     &echo_supp_reset,
-    &echo_supp_cancel_echo
+    &echo_supp_cancel_echo,
+    NULL,
+    NULL,
+    &echo_supp_get_stat
 };
 
 
@@ -99,7 +104,7 @@ static struct ec_operations echo_supp_op =
 #if defined(PJMEDIA_HAS_SPEEX_AEC) && PJMEDIA_HAS_SPEEX_AEC!=0
 static struct ec_operations speex_aec_op = 
 {
-    "AEC",
+    "Speex AEC",
     &speex_aec_create,
     &speex_aec_destroy,
     &speex_aec_reset,
@@ -123,6 +128,35 @@ static struct ec_operations ipp_aec_op =
     &ipp_aec_cancel_echo
 };
 #endif
+
+/*
+ * WebRTC AEC prototypes
+ */
+#if defined(PJMEDIA_HAS_WEBRTC_AEC) && PJMEDIA_HAS_WEBRTC_AEC!=0
+static struct ec_operations webrtc_aec_op =
+{
+    "WebRTC AEC",
+    &webrtc_aec_create,
+    &webrtc_aec_destroy,
+    &webrtc_aec_reset,
+    &webrtc_aec_cancel_echo,
+    NULL,
+    NULL,
+    &webrtc_aec_get_stat
+};
+#endif
+
+PJ_DEF(void) pjmedia_echo_stat_default(pjmedia_echo_stat *stat)
+{
+    pj_bzero(stat, sizeof(pjmedia_echo_stat));
+    stat->median = PJMEDIA_ECHO_STAT_NOT_SPECIFIED;
+    stat->std = PJMEDIA_ECHO_STAT_NOT_SPECIFIED;
+    stat->frac_delay = (float)PJMEDIA_ECHO_STAT_NOT_SPECIFIED;
+    stat->duration = PJMEDIA_ECHO_STAT_NOT_SPECIFIED;
+    stat->tail = PJMEDIA_ECHO_STAT_NOT_SPECIFIED;
+    stat->min_factor = PJMEDIA_ECHO_STAT_NOT_SPECIFIED;
+    stat->avg_factor = PJMEDIA_ECHO_STAT_NOT_SPECIFIED;
+}
 
 /*
  * Create the echo canceller. 
@@ -185,6 +219,13 @@ PJ_DEF(pj_status_t) pjmedia_echo_create2(pj_pool_t *pool,
 
 #endif
 
+#if defined(PJMEDIA_HAS_WEBRTC_AEC) && PJMEDIA_HAS_WEBRTC_AEC!=0
+    } else if ((options & PJMEDIA_ECHO_ALGO_MASK) == PJMEDIA_ECHO_WEBRTC ||
+               (options & PJMEDIA_ECHO_ALGO_MASK) == PJMEDIA_ECHO_DEFAULT)
+    {
+        ec->op = &webrtc_aec_op;
+#endif
+        
     } else {
 	ec->op = &echo_supp_op;
     }
@@ -380,8 +421,8 @@ PJ_DEF(pj_status_t) pjmedia_echo_capture( pjmedia_echo_state *echo,
     rc = pjmedia_delay_buf_get(echo->delay_buf, oldest_frm->buf);
     if (rc != PJ_SUCCESS) {
 	/* Ooops.. no frame! */
-	PJ_LOG(5,(echo->obj_name, 
-		  "No frame from delay buffer. This will upset EC later"));
+	PJ_PERROR(5,(echo->obj_name, rc,
+		  "No frame from delay buffer (this will upset EC later)"));
 	pjmedia_zero_samples(oldest_frm->buf, echo->samples_per_frame);
     }
     pj_list_push_back(&echo->lat_buf, oldest_frm);
@@ -401,5 +442,20 @@ PJ_DEF(pj_status_t) pjmedia_echo_cancel( pjmedia_echo_state *echo,
 {
     return (*echo->op->ec_cancel)( echo->state, rec_frm, play_frm, options, 
 				   reserved);
+}
+
+
+/*
+ * Get the Echo Canceller stats. 
+ */
+PJ_DEF(pj_status_t) pjmedia_echo_get_stat(pjmedia_echo_state *echo,
+					  pjmedia_echo_stat *p_stat)
+{
+    PJ_ASSERT_RETURN(p_stat, PJ_EINVAL);
+
+    if (echo->op->ec_get_stat)
+    	return (*echo->op->ec_get_stat)(echo->state, p_stat);
+
+    return PJ_ENOTSUP;
 }
 

@@ -84,9 +84,9 @@ static void on_read_complete(pj_ioqueue_key_t *key,
             return;
 
         if (bytes_read < 0) {
-            pj_status_t rc = (pj_status_t)-bytes_read;
             char errmsg[PJ_ERR_MSG_SIZE];
 
+	    rc = (pj_status_t)-bytes_read;
 	    if (rc != last_error) {
 	        //last_error = rc;
 	        pj_strerror(rc, errmsg, sizeof(errmsg));
@@ -280,6 +280,10 @@ static int perform_test(pj_bool_t allow_concur,
 
         /* randomize outgoing buffer. */
         pj_create_random_string(items[i].outgoing_buffer, buffer_size);
+
+        /* Init operation keys. */
+        pj_ioqueue_op_key_init(&items[i].recv_op, sizeof(items[i].recv_op));
+        pj_ioqueue_op_key_init(&items[i].send_op, sizeof(items[i].send_op));
 
         /* Create socket pair. */
 	TRACE_((THIS_FILE, "      calling socketpair.."));

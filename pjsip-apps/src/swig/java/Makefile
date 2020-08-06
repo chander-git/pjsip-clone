@@ -1,6 +1,14 @@
 include ../../../../build.mak
 include ../../../../build/common.mak
 
+SWIG_FLAGS=-I../../../../pjlib/include \
+		   -I../../../../pjlib-util/include \
+		   -I../../../../pjmedia/include \
+		   -I../../../../pjsip/include \
+		   -I../../../../pjnath/include -c++ 
+SRC_DIR=../../../../pjsip/include
+SRCS=$(SRC_DIR)/pjsua2/endpoint.hpp $(SRC_DIR)/pjsua2/types.hpp
+
 ifneq ($(findstring android,$(TARGET_NAME)),)
  OS=android
  ifeq ("$(JAVA_HOME)","")
@@ -21,7 +29,7 @@ else
     LIBPJSUA2_SO=$(OUT_DIR)/libpjsua2.jnilib
   else
     ifeq ($(OS),android)
-      LIBPJSUA2_SO=android/libs/armeabi/libpjsua2.so
+      LIBPJSUA2_SO=android/app/src/main/jniLibs/$(TARGET_ARCH)/libpjsua2.so
     else
       LIBPJSUA2_SO=$(OUT_DIR)/libpjsua2.so
     endif
@@ -126,9 +134,11 @@ endif
 MY_SWIG		 := swig
 MY_JAVA	 	 := "$(JAVA_BIN)/java"
 MY_JAVAC	 := "$(JAVA_BIN)/javac"
-MY_JNI_CFLAGS	 := -I"$(JAVA_INC)" -I"$(JAVA_INC)/win32" \
+ifneq ($(OS),android)
+  MY_JNI_CFLAGS  := -I"$(JAVA_INC)" -I"$(JAVA_INC)/win32" \
 		    -I"$(JAVA_INC)/linux" -I"$(JAVA_INC)/darwin" -I.
-MY_JNI_LDFLAGS	 := -L"$(JAVA_LIB)"
+  MY_JNI_LDFLAGS := -L"$(JAVA_LIB)"
+endif
 
 # OS specific
 ifeq ($(OS),Windows_NT)
@@ -137,6 +147,8 @@ else
   MY_JNI_CFLAGS	 += -fPIC
   ifeq ($(OS),android)
     MY_JNI_CFLAGS+= -D__ANDROID__
+    MY_JNI_LDFLAGS+= -Wl,-soname,libpjsua2.so
+    SWIG_FLAGS+= -D__ANDROID__
   endif
 endif
 
@@ -145,20 +157,25 @@ MY_CFLAGS	 := $(PJ_CXXFLAGS) $(MY_JNI_CFLAGS) $(CFLAGS)
 MY_LDFLAGS	 := $(PJ_LDXXFLAGS) $(PJ_LDXXLIBS) $(MY_JNI_LDFLAGS) $(LDFLAGS)
 MY_PACKAGE_NAME	 := org.pjsip.pjsua2
 ifeq ($(OS),android)
-  MY_PACKAGE_PATH  := android/src/$(subst .,/,$(MY_PACKAGE_NAME))
+  MY_PACKAGE_PATH  := android/app/src/main/java/$(subst .,/,$(MY_PACKAGE_NAME))
 else
   MY_PACKAGE_PATH  := $(OUT_DIR)/$(subst .,/,$(MY_PACKAGE_NAME))
 endif
 
-MY_APP_JAVA := android/src/$(subst .,/,$(MY_PACKAGE_NAME))/app/MyApp.java
+MY_APP_JAVA := android/app/src/main/java/$(subst .,/,$(MY_PACKAGE_NAME))/app/MyApp.java
 
 .PHONY: all java install uninstall
 
 all: $(LIBPJSUA2_SO) java
 
 $(LIBPJSUA2_SO): $(OUT_DIR)/pjsua2_wrap.o
+ifeq ($(OS),android)
+	mkdir -p android/app/src/main/jniLibs/$(TARGET_ARCH)
+	# copy libc++_shared.so manually
+	cp -f ${ANDROID_NDK_ROOT}/sources/cxx-stl/llvm-libc++/libs/${TARGET_ARCH}/libc++_shared.so android/app/src/main/jniLibs/$(TARGET_ARCH)
+endif
 	$(PJ_CXX) -shared -o $(LIBPJSUA2_SO) $(OUT_DIR)/pjsua2_wrap.o \
-		$(MY_CFLAGS) $(MY_LDFLAGS)
+		$(MY_LDFLAGS)
 
 $(OUT_DIR)/pjsua2_wrap.o: $(OUT_DIR)/pjsua2_wrap.cpp Makefile
 	$(PJ_CXX) -c $(OUT_DIR)/pjsua2_wrap.cpp -o $(OUT_DIR)/pjsua2_wrap.o \
@@ -166,6 +183,7 @@ $(OUT_DIR)/pjsua2_wrap.o: $(OUT_DIR)/pjsua2_wrap.cpp Makefile
 
 $(OUT_DIR)/pjsua2_wrap.cpp: ../pjsua2.i ../symbols.i $(SRCS)
 	mkdir -p $(MY_PACKAGE_PATH)
+	mkdir -p $(OUT_DIR)
 	swig $(SWIG_FLAGS) -java  -package $(MY_PACKAGE_NAME) \
 		-outdir $(MY_PACKAGE_PATH) \
 		-o $(OUT_DIR)/pjsua2_wrap.cpp ../pjsua2.i
@@ -175,6 +193,10 @@ clean distclean realclean:
 		$(MY_PACKAGE_PATH)/*.java $(MY_PACKAGE_PATH)/*.class
 
 java: $(MY_PACKAGE_PATH)/Error.class $(MY_PACKAGE_PATH)/test.class $(MY_PACKAGE_PATH)/sample.class
+ifneq (,$(findstring PJMEDIA_VIDEO_DEV_HAS_ANDROID=1,$(ANDROID_CFLAGS)))
+	@echo "Copying Android camera helper components..."
+	cp $(PJDIR)/pjmedia/src/pjmedia-videodev/android/PjCamera*.java $(MY_PACKAGE_PATH)/..
+endif
 
 $(MY_PACKAGE_PATH)/Error.class: $(MY_PACKAGE_PATH)/Error.java
 	$(MY_JAVAC) -d $(OUT_DIR) $(MY_PACKAGE_PATH)/*.java $(MY_APP_JAVA)
@@ -184,6 +206,8 @@ $(MY_PACKAGE_PATH)/test.class: test.java
 	
 $(MY_PACKAGE_PATH)/sample.class: sample.java
 	$(MY_JAVAC) -d $(OUT_DIR) -classpath "$(OUT_DIR)" sample.java
+	@# Build javafx sample app
+	@# $(MY_JAVAC) -d $(OUT_DIR) -classpath "$(OUT_DIR)" sample2.java
 
 test:
 	@# Need to specify classpath and library path, alternatively,
@@ -195,6 +219,9 @@ sample:
 	@# they can be set via CLASSPATH and java.library.path env settings
 	$(MY_JAVA) -cp "$(OUT_DIR)" -Djava.library.path="$(OUT_DIR)" \
 		org.pjsip.pjsua2.app.sample	
+	@# This is for sample2 app
+	@# $(MY_JAVA) -cp "$(OUT_DIR)" -Djava.library.path="$(OUT_DIR)" \
+	@#	org.pjsip.pjsua2.app.sample2	        
 
 install:
 uninstall:

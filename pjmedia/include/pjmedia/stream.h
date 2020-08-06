@@ -31,8 +31,10 @@
 #include <pjmedia/jbuf.h>
 #include <pjmedia/port.h>
 #include <pjmedia/rtcp.h>
+#include <pjmedia/rtcp_fb.h>
 #include <pjmedia/transport.h>
 #include <pjmedia/vid_codec.h>
+#include <pjmedia/stream_common.h>
 #include <pj/sock.h>
 
 PJ_BEGIN_DECL
@@ -97,6 +99,7 @@ typedef struct pjmedia_stream_info
     pj_sockaddr		rem_rtcp;   /**< Optional remote RTCP address. If
 					 sin_family is zero, the RTP address
 					 will be calculated from RTP.	    */
+    pj_bool_t		rtcp_mux;   /**< Use RTP and RTCP multiplexing.     */
 #if defined(PJMEDIA_HAS_RTCP_XR) && (PJMEDIA_HAS_RTCP_XR != 0)
     pj_bool_t		rtcp_xr_enabled;
 				    /**< Specify whether RTCP XR is enabled.*/
@@ -107,6 +110,8 @@ typedef struct pjmedia_stream_info
 					 stream. If sin_family is zero, 
 					 this will be ignored.		    */
 #endif
+    pjmedia_rtcp_fb_info loc_rtcp_fb; /**< Local RTCP-FB info.		    */
+    pjmedia_rtcp_fb_info rem_rtcp_fb; /**< Remote RTCP-FB info.		    */
     pjmedia_codec_info	fmt;	    /**< Incoming codec format info.	    */
     pjmedia_codec_param *param;	    /**< Optional codec param.		    */
     unsigned		tx_pt;	    /**< Outgoing codec paylaod type.	    */
@@ -115,6 +120,10 @@ typedef struct pjmedia_stream_info
     int		        tx_event_pt;/**< Outgoing pt for telephone-events.  */
     int			rx_event_pt;/**< Incoming pt for telephone-events.  */
     pj_uint32_t		ssrc;	    /**< RTP SSRC.			    */
+    pj_str_t		cname; 	    /**< RTCP CNAME.			    */
+    pj_bool_t		has_rem_ssrc;/**<Has remote RTP SSRC?		    */
+    pj_uint32_t		rem_ssrc;   /**< Remote RTP SSRC.		    */
+    pj_str_t		rem_cname;  /**< Remote RTCP CNAME.		    */
     pj_uint32_t		rtp_ts;	    /**< Initial RTP timestamp.		    */
     pj_uint16_t		rtp_seq;    /**< Initial RTP sequence number.	    */
     pj_uint8_t		rtp_seq_ts_set;
@@ -139,6 +148,37 @@ typedef struct pjmedia_stream_info
                                     /**< Disable automatic sending of RTCP
                                          SDES and BYE.                      */
 } pjmedia_stream_info;
+
+/**
+ * This enumeration defines flags used by #pjmedia_stream_dtmf_event.
+ */
+typedef enum pjmedia_stream_dtmf_event_flags {
+    /**
+     * The event was already indicated earlier. The new indication contains an
+     * updated event duration.
+     */
+    PJMEDIA_STREAM_DTMF_IS_UPDATE = (1 << 0),
+
+    /**
+     * The event has ended and the indication contains the final event
+     * duration.
+     * Note that end indications might get lost. Hence it is not guaranteed
+     * to receive an event with PJMEDIA_STREAM_DTMF_IS_END for every event.
+     */
+    PJMEDIA_STREAM_DTMF_IS_END = (1 << 1),
+} pjmedia_stream_dtmf_event_flags;
+
+/**
+ * This structure describes DTMF telephony-events indicated through
+ * #pjmedia_stream_set_dtmf_event_callback().
+ */
+typedef struct pjmedia_stream_dtmf_event {
+    int                 digit;      /**< DTMF digit as ASCII character.     */
+    pj_uint32_t         timestamp;  /**< RTP timestamp of the event.        */
+    pj_uint16_t         duration;   /**< Event duration, in milliseconds.   */
+    pj_uint16_t         flags;      /**< Event flags (see
+                                         #pjmedia_stream_dtmf_event_flags). */
+} pjmedia_stream_dtmf_event;
 
 
 /**
@@ -342,7 +382,8 @@ PJ_DECL(pj_status_t) pjmedia_stream_resume(pjmedia_stream *stream,
  *
  * @param stream	The media stream.
  * @param ascii_digit	String containing digits to be sent to remote as 
- *			described on RFC 2833 section 3.10. Character 'R' is 
+ *			described on RFC 2833 section 3.10. 
+ *			If PJMEDIA_HAS_DTMF_FLASH is enabled, character 'R' is
  *			used to represent the event type 16 (flash) as stated 
  *			in RFC 4730.
  *			Currently the maximum number of digits are 32.
@@ -391,6 +432,8 @@ PJ_DECL(pj_status_t) pjmedia_stream_get_dtmf( pjmedia_stream *stream,
  * Set callback to be called upon receiving DTMF digits. If callback is
  * registered, the stream will not buffer incoming DTMF but rather call
  * the callback as soon as DTMF digit is received completely.
+ * This callback will not be called if another callback is set via
+ * #pjmedia_stream_set_dtmf_event_callback() as well.
  *
  * @param stream	The media stream.
  * @param cb		Callback to be called upon receiving DTMF digits.
@@ -407,6 +450,26 @@ pjmedia_stream_set_dtmf_callback(pjmedia_stream *stream,
 					    void *user_data, 
 					    int digit), 
 				 void *user_data);
+
+/**
+ * Set callback to be called upon receiving DTMF digits. If callback is
+ * registered, the stream will not buffer incoming DTMF but rather call
+ * the callback as soon as DTMF digit is received.
+ *
+ * @param stream	The media stream.
+ * @param cb		Callback to be called upon receiving DTMF digits.
+ *			See #pjmedia_stream_dtmf_event.
+ * @param user_data	User data to be returned back when the callback
+ *			is called.
+ *
+ * @return		PJ_SUCCESS on success.
+ */
+PJ_DECL(pj_status_t)
+pjmedia_stream_set_dtmf_event_callback(pjmedia_stream *stream,
+                                       void (*cb)(pjmedia_stream*,
+                                                  void *user_data,
+                                                  const pjmedia_stream_dtmf_event *event),
+                                       void *user_data);
 
 
 /**
@@ -428,6 +491,25 @@ pjmedia_stream_send_rtcp_sdes( pjmedia_stream *stream );
  */
 PJ_DECL(pj_status_t)
 pjmedia_stream_send_rtcp_bye( pjmedia_stream *stream );
+
+
+/**
+ * Get the RTP session information of the media stream. This function can be 
+ * useful for app with custom media transport to inject/filter some 
+ * outgoing/incoming proprietary packets into normal audio RTP traffics.
+ * This will return the original pointer to the internal states of the stream, 
+ * and generally it is not advisable for app to modify them.
+ *
+ * @param stream	The media stream.
+ *
+ * @param session_info	The stream session info.
+ *
+ * @return		PJ_SUCCESS on success.
+ */
+PJ_DECL(pj_status_t)
+pjmedia_stream_get_rtp_session_info(pjmedia_stream *stream,
+			           pjmedia_stream_rtp_sess_info *session_info);
+
 
 /**
  * @}

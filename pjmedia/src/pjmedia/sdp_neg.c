@@ -38,6 +38,7 @@ struct pjmedia_sdp_neg
     pj_bool_t		  answer_was_remote;
 
     pjmedia_sdp_session	*initial_sdp,	    /**< Initial local SDP	     */
+			*initial_sdp_tmp,   /**< Temporary initial local SDP */
 			*active_local_sdp,  /**< Currently active local SDP. */
 			*active_remote_sdp, /**< Currently active remote's.  */
 			*neg_local_sdp,	    /**< Temporary local SDP.	     */
@@ -84,7 +85,7 @@ static pj_status_t custom_fmt_match( pj_pool_t *pool,
  */
 PJ_DEF(const char*) pjmedia_sdp_neg_state_str(pjmedia_sdp_neg_state state)
 {
-    if (state >=0 && state < (pjmedia_sdp_neg_state)PJ_ARRAY_SIZE(state_str))
+    if ((int)state >=0 && state < (pjmedia_sdp_neg_state)PJ_ARRAY_SIZE(state_str))
 	return state_str[state];
 
     return "<?UNKNOWN?>";
@@ -149,6 +150,7 @@ PJ_DEF(pj_status_t) pjmedia_sdp_neg_create_w_remote_offer(pj_pool_t *pool,
     PJ_ASSERT_RETURN(neg != NULL, PJ_ENOMEM);
 
     neg->prefer_remote_codec_order = PJMEDIA_SDP_NEG_PREFER_REMOTE_CODEC_ORDER;
+    neg->answer_with_multiple_codecs = PJMEDIA_SDP_NEG_ANSWER_MULTIPLE_CODECS;
     neg->neg_remote_sdp = pjmedia_sdp_session_clone(pool, remote);
 
     if (initial) {
@@ -333,7 +335,7 @@ PJ_DEF(pj_status_t) pjmedia_sdp_neg_modify_local_offer2(
      */
     pj_strdup(pool, &new_offer->origin.user, &old_offer->origin.user);
     new_offer->origin.id = old_offer->origin.id;
-    new_offer->origin.version = old_offer->origin.version + 1;
+
     pj_strdup(pool, &new_offer->origin.net_type, &old_offer->origin.net_type);
     pj_strdup(pool, &new_offer->origin.addr_type,&old_offer->origin.addr_type);
     pj_strdup(pool, &new_offer->origin.addr, &old_offer->origin.addr);
@@ -398,6 +400,18 @@ PJ_DEF(pj_status_t) pjmedia_sdp_neg_modify_local_offer2(
     }
 
     /* New_offer fixed */
+#if PJMEDIA_SDP_NEG_COMPARE_BEFORE_INC_VERSION
+    new_offer->origin.version = old_offer->origin.version;
+
+    if (pjmedia_sdp_session_cmp(new_offer, neg->initial_sdp, 0) != PJ_SUCCESS)
+    {
+	++new_offer->origin.version;
+    }    
+#else
+    new_offer->origin.version = old_offer->origin.version + 1;
+#endif
+    
+    neg->initial_sdp_tmp = neg->initial_sdp;
     neg->initial_sdp = new_offer;
     neg->neg_local_sdp = pjmedia_sdp_session_clone(pool, new_offer);
 
@@ -423,6 +437,13 @@ PJ_DEF(pj_status_t) pjmedia_sdp_neg_send_local_offer( pj_pool_t *pool,
 	/* If in STATE_DONE, set the active SDP as the offer. */
 	PJ_ASSERT_RETURN(neg->active_local_sdp, PJMEDIA_SDPNEG_ENOACTIVE);
 
+	/* Retain initial SDP */
+	if (neg->initial_sdp) {
+	    neg->initial_sdp_tmp = neg->initial_sdp;
+    	    neg->initial_sdp = pjmedia_sdp_session_clone(pool,
+							 neg->initial_sdp);
+	}
+
 	neg->state = PJMEDIA_SDP_NEG_STATE_LOCAL_OFFER;
 	neg->neg_local_sdp = pjmedia_sdp_session_clone(pool, 
 						       neg->active_local_sdp);
@@ -435,7 +456,6 @@ PJ_DEF(pj_status_t) pjmedia_sdp_neg_send_local_offer( pj_pool_t *pool,
 	*offer = neg->neg_local_sdp;
     }
 
-    
     return PJ_SUCCESS;
 }
 
@@ -490,11 +510,12 @@ PJ_DEF(pj_status_t) pjmedia_sdp_neg_set_local_answer( pj_pool_t *pool,
     /* Check arguments are valid. */
     PJ_ASSERT_RETURN(pool && neg && local, PJ_EINVAL);
 
-    /* Can only do this in STATE_REMOTE_OFFER.
-     * If we already provide local offer, then rx_remote_answer() should
+    /* Can only do this in STATE_REMOTE_OFFER or WAIT_NEGO.
+     * If we already provide local offer, then set_remote_answer() should
      * be called instead of this function.
      */
-    PJ_ASSERT_RETURN(neg->state == PJMEDIA_SDP_NEG_STATE_REMOTE_OFFER, 
+    PJ_ASSERT_RETURN(neg->state == PJMEDIA_SDP_NEG_STATE_REMOTE_OFFER ||
+    		     neg->state == PJMEDIA_SDP_NEG_STATE_WAIT_NEGO, 
 		     PJMEDIA_SDPNEG_EINSTATE);
 
     /* State now is STATE_WAIT_NEGO. */
@@ -503,6 +524,7 @@ PJ_DEF(pj_status_t) pjmedia_sdp_neg_set_local_answer( pj_pool_t *pool,
 	neg->neg_local_sdp = pjmedia_sdp_session_clone(pool, local);
 	if (neg->initial_sdp) {
 	    /* Retain initial_sdp value. */
+	    neg->initial_sdp_tmp = neg->initial_sdp;
 	    neg->initial_sdp = pjmedia_sdp_session_clone(pool,
 							 neg->initial_sdp);
         
@@ -518,6 +540,8 @@ PJ_DEF(pj_status_t) pjmedia_sdp_neg_set_local_answer( pj_pool_t *pool,
 	}
     } else {
 	PJ_ASSERT_RETURN(neg->initial_sdp, PJMEDIA_SDPNEG_ENOINITIAL);
+	neg->initial_sdp_tmp = neg->initial_sdp;
+	neg->initial_sdp = pjmedia_sdp_session_clone(pool, neg->initial_sdp);
 	neg->neg_local_sdp = pjmedia_sdp_session_clone(pool, neg->initial_sdp);
     }
 
@@ -882,7 +906,7 @@ static pj_status_t process_m_answer( pj_pool_t *pool,
  * after receiving remote answer.
  */
 static pj_status_t process_answer(pj_pool_t *pool,
-				  pjmedia_sdp_session *offer,
+				  pjmedia_sdp_session *local_offer,
 				  pjmedia_sdp_session *answer,
 				  pj_bool_t allow_asym,
 				  pjmedia_sdp_session **p_active)
@@ -890,10 +914,14 @@ static pj_status_t process_answer(pj_pool_t *pool,
     unsigned omi = 0; /* Offer media index */
     unsigned ami = 0; /* Answer media index */
     pj_bool_t has_active = PJ_FALSE;
+    pjmedia_sdp_session *offer;
     pj_status_t status;
 
     /* Check arguments. */
-    PJ_ASSERT_RETURN(pool && offer && answer && p_active, PJ_EINVAL);
+    PJ_ASSERT_RETURN(pool && local_offer && answer && p_active, PJ_EINVAL);
+
+    /* Duplicate local offer SDP. */
+    offer = pjmedia_sdp_session_clone(pool, local_offer);
 
     /* Check that media count match between offer and answer */
     // Ticket #527, different media count is allowed for more interoperability,
@@ -1046,6 +1074,8 @@ static pj_status_t match_offer(pj_pool_t *pool,
     pj_str_t pt_offer[PJMEDIA_MAX_SDP_FMT];
     pjmedia_sdp_media *answer;
     const pjmedia_sdp_media *master, *slave;
+    unsigned nclockrate = 0, clockrate[PJMEDIA_MAX_SDP_FMT];
+    unsigned ntel_clockrate = 0, tel_clockrate[PJMEDIA_MAX_SDP_FMT];
 
     /* If offer has zero port, just clone the offer */
     if (offer->desc.port == 0) {
@@ -1106,9 +1136,20 @@ static pj_status_t match_offer(pj_pool_t *pool,
 		    unsigned p;
 		    p = pj_strtoul(&slave->desc.fmt[j]);
 		    if (p == pt && pj_isdigit(*slave->desc.fmt[j].ptr)) {
+			unsigned k;
+
 			found_matching_codec = 1;
 			pt_offer[pt_answer_count] = slave->desc.fmt[j];
 			pt_answer[pt_answer_count++] = slave->desc.fmt[j];
+
+			/* Take note of clock rate for tel-event. Note: for
+			 * static PT, we assume the clock rate is 8000.
+			 */
+			for (k=0; k<nclockrate; ++k)
+			    if (clockrate[k] == 8000)
+				break;
+			if (k == nclockrate)
+			    clockrate[nclockrate++] = 8000;
 			break;
 		    }
 		}
@@ -1120,7 +1161,7 @@ static pj_status_t match_offer(pj_pool_t *pool,
 		 */
 		const pjmedia_sdp_attr *a;
 		pjmedia_sdp_rtpmap or_;
-		pj_bool_t is_codec;
+		pj_bool_t is_codec = 0;
 
 		/* Get the rtpmap for the payload type in the master. */
 		a = pjmedia_sdp_media_find_attr2(master, "rtpmap", 
@@ -1131,11 +1172,7 @@ static pj_status_t match_offer(pj_pool_t *pool,
 		}
 		pjmedia_sdp_attr_get_rtpmap(a, &or_);
 
-		if (!pj_stricmp2(&or_.enc_name, "telephone-event")) {
-		    if (found_matching_telephone_event)
-			continue;
-		    is_codec = 0;
-		} else {
+		if (pj_stricmp2(&or_.enc_name, "telephone-event")) {
 		    master_has_codec = 1;
 		    if (!answer_with_multiple_codecs && found_matching_codec)
 			continue;
@@ -1165,25 +1202,45 @@ static pj_status_t match_offer(pj_pool_t *pool,
 			{
 			    /* Match! */
 			    if (is_codec) {
-				pjmedia_sdp_media *o, *a;
+				pjmedia_sdp_media *o_med, *a_med;
 				unsigned o_fmt_idx, a_fmt_idx;
+				unsigned k;
 
-				o = (pjmedia_sdp_media*)offer;
-				a = (pjmedia_sdp_media*)preanswer;
+				o_med = (pjmedia_sdp_media*)offer;
+				a_med = (pjmedia_sdp_media*)preanswer;
 				o_fmt_idx = prefer_remote_codec_order? i:j;
 				a_fmt_idx = prefer_remote_codec_order? j:i;
 
 				/* Call custom format matching callbacks */
 				if (custom_fmt_match(pool, &or_.enc_name,
-						     o, o_fmt_idx,
-						     a, a_fmt_idx,
+						     o_med, o_fmt_idx,
+						     a_med, a_fmt_idx,
 						     ALLOW_MODIFY_ANSWER) !=
 				    PJ_SUCCESS)
 				{
 				    continue;
 				}
 				found_matching_codec = 1;
+
+				/* Take note of clock rate for tel-event */
+				for (k=0; k<nclockrate; ++k)
+				    if (clockrate[k] == or_.clock_rate)
+					break;
+				if (k == nclockrate)
+				    clockrate[nclockrate++] = or_.clock_rate;
 			    } else {
+			    	unsigned k;
+
+				/* Keep track of tel-event clock rate,
+				 * to prevent duplicate.
+				 */
+				for (k=0; k<ntel_clockrate; ++k)
+				    if (tel_clockrate[k] == or_.clock_rate)
+					break;
+				if (k < ntel_clockrate)
+				    continue;
+				
+				tel_clockrate[ntel_clockrate++] = or_.clock_rate;
 				found_matching_telephone_event = 1;
 			    }
 
@@ -1245,8 +1302,71 @@ static pj_status_t match_offer(pj_pool_t *pool,
 	return PJMEDIA_SDPNEG_NOANSUNKNOWN;
     }
 
-    /* Seems like everything is in order.
-     * Build the answer by cloning from preanswer, but rearrange the payload
+    /* Seems like everything is in order. */
+
+    /* Remove unwanted telephone-event formats. */
+    if (found_matching_telephone_event) {
+	pj_str_t first_televent_offer = {0};
+	pj_str_t first_televent_answer = {0};
+	unsigned matched_cnt = 0;
+
+	for (i=0; i<pt_answer_count; ) {
+	    const pjmedia_sdp_attr *a;
+	    pjmedia_sdp_rtpmap r;
+	    unsigned j;
+
+	    /* Skip static PT, as telephone-event uses dynamic PT */
+	    if (!pj_isdigit(*pt_answer[i].ptr) || pj_strtol(&pt_answer[i])<96)
+	    {
+		++i;
+		continue;
+	    }
+
+	    /* Get the rtpmap for format. */
+	    a = pjmedia_sdp_media_find_attr2(preanswer, "rtpmap",
+					     &pt_answer[i]);
+	    pj_assert(a);
+	    pjmedia_sdp_attr_get_rtpmap(a, &r);
+
+	    /* Only care for telephone-event format */
+	    if (pj_stricmp2(&r.enc_name, "telephone-event")) {
+		++i;
+		continue;
+	    }
+
+	    if (first_televent_offer.slen == 0) {
+		first_televent_offer = pt_offer[i];
+		first_televent_answer = pt_answer[i];
+	    }
+
+	    for (j=0; j<nclockrate; ++j) {
+		if (r.clock_rate==clockrate[j])
+		    break;
+	    }
+
+	    /* This tel-event's clockrate is unwanted, remove the tel-event */
+	    if (j==nclockrate) {
+		pj_array_erase(pt_answer, sizeof(pt_answer[0]),
+			       pt_answer_count, i);
+		pj_array_erase(pt_offer, sizeof(pt_offer[0]),
+			       pt_answer_count, i);
+		pt_answer_count--;
+	    } else {
+		++matched_cnt;
+		++i;
+	    }
+	}
+
+	/* Tel-event is wanted, but no matched clock rate (to the selected
+	 * audio codec), just put back any first matched tel-event formats.
+	 */
+	if (!matched_cnt) {
+	    pt_offer[pt_answer_count] = first_televent_offer;
+	    pt_answer[pt_answer_count++] = first_televent_answer;
+	}
+    }
+
+    /* Build the answer by cloning from preanswer, and reorder the payload
      * to suit the offer.
      */
     answer = pjmedia_sdp_media_clone(pool, preanswer);
@@ -1396,10 +1516,6 @@ PJ_DEF(pj_status_t) pjmedia_sdp_neg_cancel_offer(pjmedia_sdp_neg *neg)
 		     neg->state == PJMEDIA_SDP_NEG_STATE_REMOTE_OFFER,
 		     PJMEDIA_SDPNEG_EINSTATE);
 
-    /* Clear temporary SDP */
-    neg->neg_local_sdp = neg->neg_remote_sdp = NULL;
-    neg->has_remote_answer = PJ_FALSE;
-
     if (neg->state == PJMEDIA_SDP_NEG_STATE_LOCAL_OFFER &&
 	neg->active_local_sdp) 
     {
@@ -1409,6 +1525,15 @@ PJ_DEF(pj_status_t) pjmedia_sdp_neg_cancel_offer(pjmedia_sdp_neg *neg)
 	 */
 	neg->active_local_sdp->origin.version++;
     }
+
+    /* Revert back initial SDP */
+    if (neg->state == PJMEDIA_SDP_NEG_STATE_LOCAL_OFFER)
+	neg->initial_sdp = neg->initial_sdp_tmp;
+
+    /* Clear temporary SDP */
+    neg->initial_sdp_tmp = NULL;
+    neg->neg_local_sdp = neg->neg_remote_sdp = NULL;
+    neg->has_remote_answer = PJ_FALSE;
 
     /* Reset state to done */
     neg->state = PJMEDIA_SDP_NEG_STATE_DONE;
@@ -1458,12 +1583,21 @@ PJ_DEF(pj_status_t) pjmedia_sdp_neg_negotiate( pj_pool_t *pool,
 	    else
 		active_ver = neg->initial_sdp->origin.version;
 
+#if PJMEDIA_SDP_NEG_COMPARE_BEFORE_INC_VERSION
+	    answer->origin.version = active_ver;
+
+	    if ((neg->active_local_sdp == NULL) || 
+		(pjmedia_sdp_session_cmp(answer, neg->active_local_sdp, 0) 
+								!= PJ_SUCCESS))
+	    {
+		++answer->origin.version;
+	    }
+#else
+	    answer->origin.version = active_ver + 1;
+#endif	    
 	    /* Only update active SDPs when negotiation is successfull */
 	    neg->active_local_sdp = answer;
 	    neg->active_remote_sdp = neg->neg_remote_sdp;
-
-	    /* Increment SDP version */
-	    neg->active_local_sdp->origin.version = ++active_ver;
 	}
     }
 
@@ -1473,7 +1607,12 @@ PJ_DEF(pj_status_t) pjmedia_sdp_neg_negotiate( pj_pool_t *pool,
     /* Save state */
     neg->answer_was_remote = neg->has_remote_answer;
 
+    /* Revert back initial SDP if nego fails */
+    if (status != PJ_SUCCESS)
+	neg->initial_sdp = neg->initial_sdp_tmp;
+
     /* Clear temporary SDP */
+    neg->initial_sdp_tmp = NULL;
     neg->neg_local_sdp = neg->neg_remote_sdp = NULL;
     neg->has_remote_answer = PJ_FALSE;
 
@@ -1505,7 +1644,7 @@ static pj_status_t custom_fmt_match(pj_pool_t *pool,
 }
 
 /* Register customized SDP format negotiation callback function. */
-PJ_DECL(pj_status_t) pjmedia_sdp_neg_register_fmt_match_cb(
+PJ_DEF(pj_status_t) pjmedia_sdp_neg_register_fmt_match_cb(
 					const pj_str_t *fmt_name,
 					pjmedia_sdp_neg_fmt_match_cb cb)
 {
@@ -1596,7 +1735,12 @@ PJ_DEF(pj_status_t) pjmedia_sdp_neg_fmt_match(pj_pool_t *pool,
     pjmedia_sdp_attr_get_rtpmap(attr, &a_rtpmap);
 
     if (pj_stricmp(&o_rtpmap.enc_name, &a_rtpmap.enc_name) != 0 ||
-	o_rtpmap.clock_rate != a_rtpmap.clock_rate)
+	(o_rtpmap.clock_rate != a_rtpmap.clock_rate) ||
+	(!(pj_stricmp(&o_rtpmap.param, &a_rtpmap.param) == 0 ||
+	   (a_rtpmap.param.slen == 0 && o_rtpmap.param.slen == 1 &&
+	    *o_rtpmap.param.ptr == '1') ||
+	   (o_rtpmap.param.slen == 0 && a_rtpmap.param.slen == 1 &&
+	    *a_rtpmap.param.ptr=='1'))))
     {
 	return PJMEDIA_SDP_EFORMATNOTEQUAL;
     }

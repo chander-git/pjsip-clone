@@ -115,10 +115,10 @@ static pj_status_t ioqueue_init_key( pj_pool_t *pool,
 
     /* Create mutex for the key. */
 #if !PJ_IOQUEUE_HAS_SAFE_UNREG
-    rc = pj_lock_create_simple_mutex(poll, NULL, &key->lock);
-#endif
+    rc = pj_lock_create_simple_mutex(pool, NULL, &key->lock);
     if (rc != PJ_SUCCESS)
 	return rc;
+#endif
 
     /* Group lock */
     key->grp_lock = grp_lock;
@@ -195,14 +195,20 @@ PJ_INLINE(int) key_has_pending_connect(pj_ioqueue_key_t *key)
  * Report occurence of an event in the key to be processed by the
  * framework.
  */
-void ioqueue_dispatch_write_event(pj_ioqueue_t *ioqueue, pj_ioqueue_key_t *h)
+pj_bool_t ioqueue_dispatch_write_event( pj_ioqueue_t *ioqueue,
+				        pj_ioqueue_key_t *h)
 {
-    /* Lock the key. */
-    pj_ioqueue_lock_key(h);
+    pj_status_t rc;
+
+    /* Try lock the key. */
+    rc = pj_ioqueue_trylock_key(h);
+    if (rc != PJ_SUCCESS) {
+	return PJ_FALSE;
+    }
 
     if (IS_CLOSING(h)) {
 	pj_ioqueue_unlock_key(h);
-	return;
+	return PJ_TRUE;
     }
 
 #if defined(PJ_HAS_TCP) && PJ_HAS_TCP!=0
@@ -337,7 +343,7 @@ void ioqueue_dispatch_write_event(pj_ioqueue_t *ioqueue, pj_ioqueue_key_t *h)
 		    PJ_PERROR(4,(THIS_FILE, send_rc,
 				 "Send error for socket %d, retrying",
 				 h->fd));
-		    replace_udp_sock(h);
+		    send_rc = replace_udp_sock(h);
 		    continue;
 		}
 #endif
@@ -417,19 +423,27 @@ void ioqueue_dispatch_write_event(pj_ioqueue_t *ioqueue, pj_ioqueue_key_t *h)
          * able to process the event.
          */
 	pj_ioqueue_unlock_key(h);
+
+	return PJ_FALSE;
     }
+
+    return PJ_TRUE;
 }
 
-void ioqueue_dispatch_read_event( pj_ioqueue_t *ioqueue, pj_ioqueue_key_t *h )
+pj_bool_t ioqueue_dispatch_read_event( pj_ioqueue_t *ioqueue,
+				       pj_ioqueue_key_t *h )
 {
     pj_status_t rc;
 
-    /* Lock the key. */
-    pj_ioqueue_lock_key(h);
+    /* Try lock the key. */
+    rc = pj_ioqueue_trylock_key(h);
+    if (rc != PJ_SUCCESS) {
+	return PJ_FALSE;
+    }
 
     if (IS_CLOSING(h)) {
 	pj_ioqueue_unlock_key(h);
-	return;
+	return PJ_TRUE;
     }
 
 #   if PJ_HAS_TCP
@@ -532,9 +546,6 @@ void ioqueue_dispatch_read_event( pj_ioqueue_t *ioqueue, pj_ioqueue_key_t *h )
 #           elif (defined(PJ_HAS_UNISTD_H) && PJ_HAS_UNISTD_H != 0)
                 bytes_read = read(h->fd, read_op->buf, bytes_read);
                 rc = (bytes_read >= 0) ? PJ_SUCCESS : pj_get_os_error();
-#	    elif defined(PJ_LINUX_KERNEL) && PJ_LINUX_KERNEL != 0
-                bytes_read = sys_read(h->fd, read_op->buf, bytes_read);
-                rc = (bytes_read >= 0) ? PJ_SUCCESS : -bytes_read;
 #           else
 #               error "Implement read() for this platform!"
 #           endif
@@ -567,7 +578,10 @@ void ioqueue_dispatch_read_event( pj_ioqueue_t *ioqueue, pj_ioqueue_key_t *h )
 	    if (rc == PJ_STATUS_FROM_OS(ENOTCONN) && !IS_CLOSING(h) &&
 		h->fd_type==pj_SOCK_DGRAM())
 	    {
-		replace_udp_sock(h);
+		rc = replace_udp_sock(h);
+		if (rc != PJ_SUCCESS) {
+		    bytes_read = -rc;
+		}
 	    }
 #endif
 	}
@@ -604,16 +618,25 @@ void ioqueue_dispatch_read_event( pj_ioqueue_t *ioqueue, pj_ioqueue_key_t *h )
          * able to process the event.
          */
 	pj_ioqueue_unlock_key(h);
+
+	return PJ_FALSE;
     }
+
+    return PJ_TRUE;
 }
 
 
-void ioqueue_dispatch_exception_event( pj_ioqueue_t *ioqueue, 
-                                       pj_ioqueue_key_t *h )
+pj_bool_t ioqueue_dispatch_exception_event( pj_ioqueue_t *ioqueue,
+					    pj_ioqueue_key_t *h )
 {
     pj_bool_t has_lock;
+    pj_status_t rc;
 
-    pj_ioqueue_lock_key(h);
+    /* Try lock the key. */
+    rc = pj_ioqueue_trylock_key(h);
+    if (rc != PJ_SUCCESS) {
+	return PJ_FALSE;
+    }
 
     if (!h->connecting) {
         /* It is possible that more than one thread was woken up, thus
@@ -621,12 +644,12 @@ void ioqueue_dispatch_exception_event( pj_ioqueue_t *ioqueue,
          * it has been processed by other thread.
          */
 	pj_ioqueue_unlock_key(h);
-        return;
+	return PJ_TRUE;
     }
 
     if (IS_CLOSING(h)) {
 	pj_ioqueue_unlock_key(h);
-	return;
+	return PJ_TRUE;
     }
 
     /* Clear operation. */
@@ -668,6 +691,8 @@ void ioqueue_dispatch_exception_event( pj_ioqueue_t *ioqueue,
     if (has_lock) {
 	pj_ioqueue_unlock_key(h);
     }
+
+    return PJ_TRUE;
 }
 
 /*
@@ -694,6 +719,7 @@ PJ_DEF(pj_status_t) pj_ioqueue_recv(  pj_ioqueue_key_t *key,
 	return PJ_ECANCELLED;
 
     read_op = (struct read_operation*)op_key;
+    PJ_ASSERT_RETURN(read_op->op == PJ_IOQUEUE_OP_NONE, PJ_EPENDING);
     read_op->op = PJ_IOQUEUE_OP_NONE;
 
     /* Try to see if there's data immediately available. 
@@ -767,6 +793,7 @@ PJ_DEF(pj_status_t) pj_ioqueue_recvfrom( pj_ioqueue_key_t *key,
 	return PJ_ECANCELLED;
 
     read_op = (struct read_operation*)op_key;
+    PJ_ASSERT_RETURN(read_op->op == PJ_IOQUEUE_OP_NONE, PJ_EPENDING);
     read_op->op = PJ_IOQUEUE_OP_NONE;
 
     /* Try to see if there's data immediately available. 
@@ -1002,18 +1029,22 @@ retry_on_restart:
 #if defined(PJ_IPHONE_OS_HAS_MULTITASKING_SUPPORT) && \
 	    PJ_IPHONE_OS_HAS_MULTITASKING_SUPPORT!=0
 		/* Special treatment for dead UDP sockets here, see ticket #1107 */
-		if (status==PJ_STATUS_FROM_OS(EPIPE) && !IS_CLOSING(key) &&
-		    key->fd_type==pj_SOCK_DGRAM() && !restart_retry)
+		if (status == PJ_STATUS_FROM_OS(EPIPE) && !IS_CLOSING(key) &&
+		    key->fd_type == pj_SOCK_DGRAM())
 		{
-		    PJ_PERROR(4,(THIS_FILE, status,
-				 "Send error for socket %d, retrying",
-				 key->fd));
-		    replace_udp_sock(key);
-		    restart_retry = PJ_TRUE;
-		    goto retry_on_restart;
+		    if (!restart_retry) {
+			PJ_PERROR(4, (THIS_FILE, status,
+				      "Send error for socket %d, retrying",
+				      key->fd));
+			status = replace_udp_sock(key);
+			if (status == PJ_SUCCESS) {
+			    restart_retry = PJ_TRUE;
+			    goto retry_on_restart;
+			}
+		    }
+		    status = PJ_ESOCKETSTOP;
 		}
 #endif
-
                 return status;
             }
         }
@@ -1102,6 +1133,7 @@ PJ_DEF(pj_status_t) pj_ioqueue_accept( pj_ioqueue_key_t *key,
 	return PJ_ECANCELLED;
 
     accept_op = (struct accept_operation*)op_key;
+    PJ_ASSERT_RETURN(accept_op->op == PJ_IOQUEUE_OP_NONE, PJ_EPENDING);
     accept_op->op = PJ_IOQUEUE_OP_NONE;
 
     /* Fast track:
@@ -1252,7 +1284,8 @@ PJ_DEF(pj_status_t) pj_ioqueue_post_completion( pj_ioqueue_key_t *key,
             op_rec->op = PJ_IOQUEUE_OP_NONE;
             pj_ioqueue_unlock_key(key);
 
-            (*key->cb.on_read_complete)(key, op_key, bytes_status);
+            if (key->cb.on_read_complete)
+            	(*key->cb.on_read_complete)(key, op_key, bytes_status);
             return PJ_SUCCESS;
         }
         op_rec = op_rec->next;
@@ -1266,7 +1299,8 @@ PJ_DEF(pj_status_t) pj_ioqueue_post_completion( pj_ioqueue_key_t *key,
             op_rec->op = PJ_IOQUEUE_OP_NONE;
             pj_ioqueue_unlock_key(key);
 
-            (*key->cb.on_write_complete)(key, op_key, bytes_status);
+            if (key->cb.on_write_complete)
+            	(*key->cb.on_write_complete)(key, op_key, bytes_status);
             return PJ_SUCCESS;
         }
         op_rec = op_rec->next;
@@ -1280,9 +1314,11 @@ PJ_DEF(pj_status_t) pj_ioqueue_post_completion( pj_ioqueue_key_t *key,
             op_rec->op = PJ_IOQUEUE_OP_NONE;
             pj_ioqueue_unlock_key(key);
 
-            (*key->cb.on_accept_complete)(key, op_key, 
-                                          PJ_INVALID_SOCKET,
-                                          (pj_status_t)bytes_status);
+            if (key->cb.on_accept_complete) {
+            	(*key->cb.on_accept_complete)(key, op_key, 
+                                              PJ_INVALID_SOCKET,
+                                              (pj_status_t)bytes_status);
+            }
             return PJ_SUCCESS;
         }
         op_rec = op_rec->next;
@@ -1322,6 +1358,14 @@ PJ_DEF(pj_status_t) pj_ioqueue_lock_key(pj_ioqueue_key_t *key)
 	return pj_grp_lock_acquire(key->grp_lock);
     else
 	return pj_lock_acquire(key->lock);
+}
+
+PJ_DEF(pj_status_t) pj_ioqueue_trylock_key(pj_ioqueue_key_t *key)
+{
+    if (key->grp_lock)
+	return pj_grp_lock_tryacquire(key->grp_lock);
+    else
+	return pj_lock_tryacquire(key->lock);
 }
 
 PJ_DEF(pj_status_t) pj_ioqueue_unlock_key(pj_ioqueue_key_t *key)

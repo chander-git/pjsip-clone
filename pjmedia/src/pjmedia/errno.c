@@ -20,8 +20,7 @@
 #include <pjmedia/errno.h>
 #include <pjmedia/types.h>
 #include <pj/string.h>
-#if defined(PJMEDIA_SOUND_IMPLEMENTATION) && \
-    PJMEDIA_SOUND_IMPLEMENTATION == PJMEDIA_SOUND_PORTAUDIO_SOUND
+#if PJMEDIA_AUDIO_DEV_HAS_PORTAUDIO
 #   include <portaudio.h>
 #endif
 
@@ -64,9 +63,10 @@ static const struct
     PJ_BUILD_ERR( PJMEDIA_SDP_ENOFMT,	    "No SDP payload format in the media line" ),
     PJ_BUILD_ERR( PJMEDIA_SDP_EINPT,	    "Invalid SDP payload type in media line" ),
     PJ_BUILD_ERR( PJMEDIA_SDP_EINFMTP,	    "Invalid SDP fmtp attribute" ),
-    PJ_BUILD_ERR( PJMEDIA_SDP_EINRTCP,	    "Invalid SDP rtcp attribyte" ),
+    PJ_BUILD_ERR( PJMEDIA_SDP_EINRTCP,	    "Invalid SDP rtcp attribute" ),
     PJ_BUILD_ERR( PJMEDIA_SDP_EINPROTO,	    "Invalid SDP media transport protocol" ),
     PJ_BUILD_ERR( PJMEDIA_SDP_EINBANDW,	    "Invalid SDP bandwidth info line" ),
+    PJ_BUILD_ERR( PJMEDIA_SDP_EINSSRC,	    "Invalid SDP ssrc attribute" ),
 
     /* SDP negotiator errors. */
     PJ_BUILD_ERR( PJMEDIA_SDPNEG_EINSTATE,	"Invalid SDP negotiator state for operation" ),
@@ -117,6 +117,7 @@ static const struct
     PJ_BUILD_ERR( PJMEDIA_RTP_EINDTMF,	    "Invalid DTMF digit" ),
     PJ_BUILD_ERR( PJMEDIA_RTP_EREMNORFC2833,"Remote does not support RFC 2833" ),
     PJ_BUILD_ERR( PJMEDIA_EBADFMT,	    "Bad format"),
+    PJ_BUILD_ERR( PJMEDIA_EUNSUPMEDIATYPE,  "Unsupported media type"),
 
     /* RTP session errors. */
     PJ_BUILD_ERR( PJMEDIA_RTP_EINPKT,	    "Invalid RTP packet" ),
@@ -164,7 +165,13 @@ static const struct
     PJ_BUILD_ERR( PJMEDIA_SRTP_ESDPINCRYPTOTAG, "Invalid SRTP crypto tag" ),
     PJ_BUILD_ERR( PJMEDIA_SRTP_ESDPINTRANSPORT, "Invalid SDP media transport for SRTP" ),
     PJ_BUILD_ERR( PJMEDIA_SRTP_ESDPREQCRYPTO,   "SRTP crypto attribute required" ),
-    PJ_BUILD_ERR( PJMEDIA_SRTP_ESDPREQSECTP,    "Secure transport required in SDP media descriptor" )
+    PJ_BUILD_ERR( PJMEDIA_SRTP_ESDPREQSECTP,    "Secure transport required in SDP media descriptor" ),
+    PJ_BUILD_ERR( PJMEDIA_SRTP_EKEYNOTREADY,    "SRTP parameters negotiation still in progress" ),
+    PJ_BUILD_ERR( PJMEDIA_SRTP_DTLS_ENOCRYPTO,  "No matching SRTP crypto-suite after DTLS nego" ),
+    PJ_BUILD_ERR( PJMEDIA_SRTP_DTLS_EPEERNOCERT,"No certificate supplied by peer in DTLS nego" ),
+    PJ_BUILD_ERR( PJMEDIA_SRTP_DTLS_EFPNOTMATCH,"Fingerprint from signalling not match to actual fingerprint" ),
+    PJ_BUILD_ERR( PJMEDIA_SRTP_DTLS_ENOFPRINT,	"Fingerprint not found" ),
+    PJ_BUILD_ERR( PJMEDIA_SRTP_DTLS_ENOPROFILE,	"No valid SRTP protection profile found" )
 #endif
 
 };
@@ -184,8 +191,7 @@ PJ_DEF(pj_str_t) pjmedia_strerror( pj_status_t statcode,
 #if defined(PJ_HAS_ERROR_STRING) && (PJ_HAS_ERROR_STRING != 0)
 
     /* See if the error comes from PortAudio. */
-#if defined(PJMEDIA_SOUND_IMPLEMENTATION) && \
-    PJMEDIA_SOUND_IMPLEMENTATION == PJMEDIA_SOUND_PORTAUDIO_SOUND
+#if PJMEDIA_AUDIO_DEV_HAS_PORTAUDIO
     if (statcode >= PJMEDIA_PORTAUDIO_ERRNO_START &&
 	statcode <= PJMEDIA_PORTAUDIO_ERRNO_END)
     {
@@ -202,7 +208,7 @@ PJ_DEF(pj_str_t) pjmedia_strerror( pj_status_t statcode,
 	return errstr;
 
     } else 
-#endif	/* PJMEDIA_SOUND_IMPLEMENTATION */
+#endif	/* PJMEDIA_AUDIO_DEV_HAS_PORTAUDIO */
 
 #if defined(PJMEDIA_HAS_SRTP) && (PJMEDIA_HAS_SRTP != 0)
     /* LIBSRTP error */

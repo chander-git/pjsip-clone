@@ -103,6 +103,12 @@ struct perm_t
     void	   *req_token;
 };
 
+struct conn_bind_t
+{
+    pj_uint32_t	     id;		/* Connection ID.	*/
+    pj_sockaddr	     peer_addr;		/* Peer address.	*/
+    unsigned	     peer_addr_len;
+};
 
 /* The TURN client session structure */
 struct pj_turn_session
@@ -208,6 +214,7 @@ static void on_timer_event(pj_timer_heap_t *th, pj_timer_entry *e);
 PJ_DEF(void) pj_turn_alloc_param_default(pj_turn_alloc_param *prm)
 {
     pj_bzero(prm, sizeof(*prm));
+    prm->peer_conn_type = PJ_TURN_TP_UDP;
 }
 
 /*
@@ -328,12 +335,8 @@ static void turn_sess_on_destroy(void *comp)
 
     /* Destroy pool */
     if (sess->pool) {
-	pj_pool_t *pool = sess->pool;
-
 	PJ_LOG(4,(sess->obj_name, "TURN client session destroyed"));
-
-	sess->pool = NULL;
-	pj_pool_release(pool);
+	pj_pool_safe_release(&sess->pool);
     }
 }
 
@@ -608,9 +611,16 @@ PJ_DEF(pj_status_t) pj_turn_session_set_server( pj_turn_session *sess,
 	    goto on_return;
 	}
 
+	/* Init DNS resolution option for IPv6 */
+	if (sess->af == pj_AF_INET6())
+	    opt |= PJ_DNS_SRV_RESOLVE_AAAA_ONLY;
+
 	/* Fallback to DNS A only if default port is specified */
 	if (default_port>0 && default_port<65536) {
-	    opt = PJ_DNS_SRV_FALLBACK_A;
+	    if (sess->af == pj_AF_INET6())
+		opt |= PJ_DNS_SRV_FALLBACK_AAAA;
+	    else
+		opt |= PJ_DNS_SRV_FALLBACK_A;
 	    sess->default_port = (pj_uint16_t)default_port;
 	}
 
@@ -625,11 +635,15 @@ PJ_DEF(pj_status_t) pj_turn_session_set_server( pj_turn_session *sess,
 	    goto on_return;
 	}
 
+	/* Add reference before async DNS resolution */
+	pj_grp_lock_add_ref(sess->grp_lock);
+
 	status = pj_dns_srv_resolve(domain, &res_name, default_port, 
 				    sess->pool, resolver, opt, sess, 
 				    &dns_srv_resolver_cb, NULL);
 	if (status != PJ_SUCCESS) {
 	    set_state(sess, PJ_TURN_STATE_NULL);
+	    pj_grp_lock_dec_ref(sess->grp_lock);
 	    goto on_return;
 	}
 
@@ -670,7 +684,7 @@ PJ_DEF(pj_status_t) pj_turn_session_set_server( pj_turn_session *sess,
 	    pj_sockaddr *addr = &sess->srv_addr_list[i];
 	    pj_memcpy(addr, &ai[i].ai_addr, sizeof(pj_sockaddr));
 	    addr->addr.sa_family = sess->af;
-	    addr->ipv4.sin_port = pj_htons(sess->default_port);
+	    pj_sockaddr_set_port(addr, sess->default_port);
 	}
 
 	sess->srv_addr = &sess->srv_addr_list[0];
@@ -716,6 +730,15 @@ PJ_DEF(pj_status_t) pj_turn_session_alloc(pj_turn_session *sess,
     PJ_ASSERT_RETURN(sess->state>PJ_TURN_STATE_NULL && 
 		     sess->state<=PJ_TURN_STATE_RESOLVED, 
 		     PJ_EINVALIDOP);
+    PJ_ASSERT_RETURN(param->peer_conn_type == PJ_TURN_TP_UDP ||
+                     param->peer_conn_type == PJ_TURN_TP_TCP,
+                     PJ_EINVAL);
+
+    /* Verify address family in allocation param */
+    if (param && param->af) {
+	PJ_ASSERT_RETURN(param->af==pj_AF_INET() || param->af==pj_AF_INET6(),
+			 PJ_EINVAL);
+    }
 
     pj_grp_lock_acquire(sess->grp_lock);
 
@@ -747,7 +770,7 @@ PJ_DEF(pj_status_t) pj_turn_session_alloc(pj_turn_session *sess,
     /* MUST include REQUESTED-TRANSPORT attribute */
     pj_stun_msg_add_uint_attr(tdata->pool, tdata->msg,
 			      PJ_STUN_ATTR_REQ_TRANSPORT, 
-			      PJ_STUN_SET_RT_PROTO(PJ_TURN_TP_UDP));
+			      PJ_STUN_SET_RT_PROTO(param->peer_conn_type));
 
     /* Include BANDWIDTH if requested */
     if (sess->alloc_param.bandwidth > 0) {
@@ -761,6 +784,23 @@ PJ_DEF(pj_status_t) pj_turn_session_alloc(pj_turn_session *sess,
 	pj_stun_msg_add_uint_attr(tdata->pool, tdata->msg,
 				  PJ_STUN_ATTR_LIFETIME,
 				  sess->alloc_param.lifetime);
+    }
+
+    /* Include ADDRESS-FAMILY if requested */
+    if (sess->alloc_param.af || sess->af == pj_AF_INET6()) {
+	enum  { IPV4_AF_TYPE = 0x01 << 24,
+		IPV6_AF_TYPE = 0x02 << 24 };
+
+	if (sess->alloc_param.af == pj_AF_INET6() ||
+	    (sess->alloc_param.af == 0 && sess->af == pj_AF_INET6()))
+	{
+	    pj_stun_msg_add_uint_attr(tdata->pool, tdata->msg,
+				      PJ_STUN_ATTR_REQ_ADDR_TYPE, IPV6_AF_TYPE);
+	} else if (sess->alloc_param.af == pj_AF_INET()) {
+	    /* For IPv4, only add the attribute when explicitly requested */
+	    pj_stun_msg_add_uint_attr(tdata->pool, tdata->msg,
+				      PJ_STUN_ATTR_REQ_ADDR_TYPE, IPV4_AF_TYPE);
+	}
     }
 
     /* Server address must be set */
@@ -777,7 +817,8 @@ PJ_DEF(pj_status_t) pj_turn_session_alloc(pj_turn_session *sess,
 	/* Set state back to RESOLVED. We don't want to destroy session now,
 	 * let the application do it if it wants to.
 	 */
-	set_state(sess, PJ_TURN_STATE_RESOLVED);
+	/* Set state back to RESOLVED may cause infinite loop (see #1942). */
+	//set_state(sess, PJ_TURN_STATE_RESOLVED);
     }
 
     pj_grp_lock_release(sess->grp_lock);
@@ -967,6 +1008,12 @@ PJ_DEF(pj_status_t) pj_turn_session_sendto( pj_turn_session *sess,
 	}
     }
 
+    /* If peer connection is TCP (RFC 6062), send it directly */
+    if (sess->alloc_param.peer_conn_type == PJ_TURN_TP_TCP) {
+	status = sess->cb.on_send_pkt(sess, pkt, pkt_len, addr, addr_len);
+	goto on_return;
+    }
+
     /* See if the peer is bound to a channel number */
     ch = lookup_ch_by_addr(sess, addr, pj_sockaddr_get_len(addr), 
 			   PJ_FALSE, PJ_FALSE);
@@ -1107,13 +1154,77 @@ on_return:
 
 
 /**
- * Notify TURN client session upon receiving a packet from server.
- * The packet maybe a STUN packet or ChannelData packet.
+ * Send ConnectionBind request.
  */
+PJ_DEF(pj_status_t) pj_turn_session_connection_bind(
+					    pj_turn_session *sess,
+					    pj_pool_t *pool,
+					    pj_uint32_t conn_id,
+					    const pj_sockaddr_t *peer_addr,
+					    unsigned addr_len)
+{
+    pj_stun_tx_data *tdata;
+    struct conn_bind_t *conn_bind;
+    pj_status_t status;
+
+    PJ_ASSERT_RETURN(sess && pool && conn_id && peer_addr && addr_len,
+		     PJ_EINVAL);
+    PJ_ASSERT_RETURN(sess->state == PJ_TURN_STATE_READY, PJ_EINVALIDOP);
+
+    pj_grp_lock_acquire(sess->grp_lock);
+
+    /* Create blank ConnectionBind request */
+    status = pj_stun_session_create_req(sess->stun, 
+					PJ_STUN_CONNECTION_BIND_REQUEST,
+					PJ_STUN_MAGIC, NULL, &tdata);
+    if (status != PJ_SUCCESS)
+	goto on_return;
+
+    /* Add CONNECTION_ID attribute */
+    pj_stun_msg_add_uint_attr(tdata->pool, tdata->msg,
+			      PJ_STUN_ATTR_CONNECTION_ID,
+			      conn_id);
+
+    conn_bind = PJ_POOL_ZALLOC_T(pool, struct conn_bind_t);
+    conn_bind->id = conn_id;
+    pj_sockaddr_cp(&conn_bind->peer_addr, peer_addr);
+    conn_bind->peer_addr_len = addr_len;
+
+    /* Send the request, associate connection data structure with tdata 
+     * for future reference when we receive the ConnectionBind response.
+     */
+    status = pj_stun_session_send_msg(sess->stun, conn_bind, PJ_FALSE,
+				      PJ_FALSE, peer_addr, addr_len, tdata);
+
+on_return:
+    pj_grp_lock_release(sess->grp_lock);
+    return status;
+}
+
 PJ_DEF(pj_status_t) pj_turn_session_on_rx_pkt(pj_turn_session *sess,
 					      void *pkt,
 					      pj_size_t pkt_len,
 					      pj_size_t *parsed_len)
+{
+    pj_turn_session_on_rx_pkt_param prm;
+    pj_status_t status;
+    
+    pj_bzero(&prm, sizeof(prm));
+    prm.pkt = pkt;
+    prm.pkt_len = pkt_len;
+    status = pj_turn_session_on_rx_pkt2(sess, &prm);
+    if (status == PJ_SUCCESS && parsed_len)
+	*parsed_len = prm.parsed_len;
+    return status;
+}
+
+/**
+ * Notify TURN client session upon receiving a packet from server.
+ * The packet maybe a STUN packet or ChannelData packet.
+ */
+PJ_DEF(pj_status_t) pj_turn_session_on_rx_pkt2(
+				pj_turn_session *sess,
+				pj_turn_session_on_rx_pkt_param *prm)
 {
     pj_bool_t is_stun;
     pj_status_t status;
@@ -1129,53 +1240,52 @@ PJ_DEF(pj_status_t) pj_turn_session_on_rx_pkt(pj_turn_session *sess,
     is_datagram = (sess->conn_type==PJ_TURN_TP_UDP);
 
     /* Quickly check if this is STUN message */
-    is_stun = ((((pj_uint8_t*)pkt)[0] & 0xC0) == 0);
+    is_stun = ((((pj_uint8_t*)prm->pkt)[0] & 0xC0) == 0);
 
     if (is_stun) {
 	/* This looks like STUN, give it to the STUN session */
 	unsigned options;
+	const pj_sockaddr_t *src_addr = prm->src_addr?
+					prm->src_addr:sess->srv_addr;
+	unsigned src_addr_len = prm->src_addr_len? prm->src_addr_len:
+				pj_sockaddr_get_len(sess->srv_addr);
 
 	options = PJ_STUN_CHECK_PACKET | PJ_STUN_NO_FINGERPRINT_CHECK;
 	if (is_datagram)
 	    options |= PJ_STUN_IS_DATAGRAM;
-	status=pj_stun_session_on_rx_pkt(sess->stun, pkt, pkt_len,
-					 options, NULL, parsed_len,
-					 sess->srv_addr,
-					 pj_sockaddr_get_len(sess->srv_addr));
+	status=pj_stun_session_on_rx_pkt(sess->stun, prm->pkt, prm->pkt_len,
+					 options, NULL, &prm->parsed_len,
+					 src_addr, src_addr_len);
 
     } else {
 	/* This must be ChannelData. */
 	pj_turn_channel_data cd;
 	struct ch_t *ch;
 
-	if (pkt_len < 4) {
-	    if (parsed_len) *parsed_len = 0;
+	if (prm->pkt_len < 4) {
+	    prm->parsed_len = 0;
 	    return PJ_ETOOSMALL;
 	}
 
 	/* Decode ChannelData packet */
-	pj_memcpy(&cd, pkt, sizeof(pj_turn_channel_data));
+	pj_memcpy(&cd, prm->pkt, sizeof(pj_turn_channel_data));
 	cd.ch_number = pj_ntohs(cd.ch_number);
 	cd.length = pj_ntohs(cd.length);
 
 	/* Check that size is sane */
-	if (pkt_len < cd.length+sizeof(cd)) {
-	    if (parsed_len) {
-		if (is_datagram) {
-		    /* Discard the datagram */
-		    *parsed_len = pkt_len;
-		} else {
-		    /* Insufficient fragment */
-		    *parsed_len = 0;
-		}
+	if (prm->pkt_len < cd.length+sizeof(cd)) {
+	    if (is_datagram) {
+		/* Discard the datagram */
+		prm->parsed_len = prm->pkt_len;
+	    } else {
+		/* Insufficient fragment */
+		prm->parsed_len = 0;
 	    }
 	    status = PJ_ETOOSMALL;
 	    goto on_return;
 	} else {
-	    if (parsed_len) {
-		/* Apply padding too */
-		*parsed_len = ((cd.length + 3) & (~3)) + sizeof(cd);
-	    }
+	    /* Apply padding too */
+	    prm->parsed_len = ((cd.length + 3) & (~3)) + sizeof(cd);
 	}
 
 	/* Lookup channel */
@@ -1187,7 +1297,7 @@ PJ_DEF(pj_status_t) pj_turn_session_on_rx_pkt(pj_turn_session *sess,
 
 	/* Notify application */
 	if (sess->cb.on_rx_data) {
-	    (*sess->cb.on_rx_data)(sess, ((pj_uint8_t*)pkt)+sizeof(cd), 
+	    (*sess->cb.on_rx_data)(sess, ((pj_uint8_t*)prm->pkt)+sizeof(cd), 
 				   cd.length, &ch->addr,
 				   pj_sockaddr_get_len(&ch->addr));
 	}
@@ -1216,9 +1326,15 @@ static pj_status_t stun_on_send_msg(pj_stun_session *stun,
     PJ_UNUSED_ARG(token);
 
     sess = (pj_turn_session*) pj_stun_session_get_user_data(stun);
-    return (*sess->cb.on_send_pkt)(sess, (const pj_uint8_t*)pkt, 
-				   (unsigned)pkt_size, 
-				   dst_addr, addr_len);
+    if (sess->cb.on_stun_send_pkt) {
+    	return (*sess->cb.on_stun_send_pkt)(sess, (const pj_uint8_t*)pkt,
+				       	    (unsigned)pkt_size,
+				       	    dst_addr, addr_len);
+    } else {
+    	return (*sess->cb.on_send_pkt)(sess, (const pj_uint8_t*)pkt,
+				       (unsigned)pkt_size,
+				       dst_addr, addr_len);
+    }
 }
 
 
@@ -1291,7 +1407,6 @@ static void on_allocate_success(pj_turn_session *sess,
     const pj_stun_xor_relayed_addr_attr *raddr_attr;
     const pj_stun_sockaddr_attr *mapped_attr;
     pj_str_t s;
-    pj_time_val timeout;
 
     /* Must have LIFETIME attribute */
     lf_attr = (const pj_stun_lifetime_attr*)
@@ -1344,11 +1459,15 @@ static void on_allocate_success(pj_turn_session *sess,
 				    "RELAY-ADDRESS attribute"));
 	return;
     }
-    if (raddr_attr && raddr_attr->sockaddr.addr.sa_family != sess->af) {
+    if (raddr_attr &&
+	((sess->alloc_param.af != 0 &&
+	  raddr_attr->sockaddr.addr.sa_family != sess->alloc_param.af) ||
+	 (sess->alloc_param.af == 0 &&
+	  raddr_attr->sockaddr.addr.sa_family != sess->af)))
+    {
 	on_session_fail(sess, method, PJNATH_EINSTUNMSG,
-			pj_cstr(&s, "Error: RELAY-ADDRESS with non IPv4"
-				    " address family is not supported "
-				    "for now"));
+			pj_cstr(&s, "Error: Mismatched RELAY-ADDRESS "
+				    "address family"));
 	return;
     }
     if (raddr_attr && !pj_sockaddr_has_addr(&raddr_attr->sockaddr)) {
@@ -1396,6 +1515,7 @@ static void on_allocate_success(pj_turn_session *sess,
 
     /* Start keep-alive timer once allocation succeeds */
     if (sess->state < PJ_TURN_STATE_DEALLOCATING) {
+	pj_time_val timeout;
 	timeout.sec = sess->ka_interval;
 	timeout.msec = 0;
 
@@ -1607,6 +1727,36 @@ static void stun_on_request_complete(pj_stun_session *stun,
 	    }
 	}
 
+    } else if (method == PJ_STUN_CONNECTION_BIND_METHOD) {
+	/* Handle ConnectionBind response */
+	struct conn_bind_t *conn_bind = (struct conn_bind_t*)token;
+
+	if (status != PJ_SUCCESS ||
+	    !PJ_STUN_IS_SUCCESS_RESPONSE(response->hdr.type)) 
+	{
+	    pj_str_t reason = {0};
+	    if (status == PJ_SUCCESS) {
+		const pj_stun_errcode_attr *err_attr;
+		err_attr = (const pj_stun_errcode_attr*)
+			   pj_stun_msg_find_attr(response,
+						 PJ_STUN_ATTR_ERROR_CODE, 0);
+		if (err_attr) {
+		    status = PJ_STATUS_FROM_STUN_CODE(err_attr->err_code);
+		    reason = err_attr->reason;
+		} else {
+		    status = PJNATH_EINSTUNMSG;
+		}
+	    }
+	    pj_perror(1, sess->obj_name, status, "ConnectionBind failed: %.*s",
+		      (int)reason.slen, reason.ptr);
+	}
+
+	/* Notify app */
+	if (sess->cb.on_connection_bind_status) {
+	    (*sess->cb.on_connection_bind_status)
+			(sess, status, conn_bind->id,
+			&conn_bind->peer_addr, conn_bind->peer_addr_len);
+	}
     } else {
 	PJ_LOG(4,(sess->obj_name, "Unexpected STUN %s response",
 		  pj_stun_get_method_name(response->hdr.type)));
@@ -1639,7 +1789,38 @@ static pj_status_t stun_on_rx_indication(pj_stun_session *stun,
 
     sess = (pj_turn_session*)pj_stun_session_get_user_data(stun);
 
-    /* Expecting Data Indication only */
+    /* ConnectionAttempt Indication */
+    if (msg->hdr.type == PJ_STUN_CONNECTION_ATTEMPT_INDICATION) {
+        pj_stun_uint_attr *connection_id_attr;
+
+        /* Get CONNECTION-ID attribute */
+        connection_id_attr = (pj_stun_uint_attr*)
+            pj_stun_msg_find_attr(msg, PJ_STUN_ATTR_CONNECTION_ID, 0);
+
+        /* Get XOR-PEER-ADDRESS attribute */
+        peer_attr = (pj_stun_xor_peer_addr_attr*)
+            pj_stun_msg_find_attr(msg, PJ_STUN_ATTR_XOR_PEER_ADDR, 0);
+
+        /* Must have both XOR-PEER-ADDRESS and CONNECTION-ID attributes */
+        if (!peer_attr || !connection_id_attr) {
+            PJ_LOG(4,(sess->obj_name, 
+                      "Received ConnectionAttempt indication with missing "
+		      "attributes"));
+            return PJ_EINVALIDOP;
+        }
+
+        /* Notify application */
+        if (sess->cb.on_connection_attempt) {
+            (*sess->cb.on_connection_attempt)
+				(sess,
+				connection_id_attr->value,
+				&peer_attr->sockaddr,
+                                pj_sockaddr_get_len(&peer_attr->sockaddr));
+        }
+        return PJ_SUCCESS;
+    }
+
+    /* Next, expecting Data Indication only */
     if (msg->hdr.type != PJ_STUN_DATA_INDICATION) {
 	PJ_LOG(4,(sess->obj_name, "Unexpected STUN %s indication",
 		  pj_stun_get_method_name(msg->hdr.type)));
@@ -1694,6 +1875,7 @@ static void dns_srv_resolver_cb(void *user_data,
     if (status != PJ_SUCCESS || sess->pending_destroy) {
 	set_state(sess, PJ_TURN_STATE_DESTROYING);
 	sess_shutdown(sess, status);
+	pj_grp_lock_dec_ref(sess->grp_lock);
 	return;
     }
 
@@ -1718,13 +1900,18 @@ static void dns_srv_resolver_cb(void *user_data,
 	for (j=0; j<rec->entry[i].server.addr_count && 
 		  cnt<PJ_TURN_MAX_DNS_SRV_CNT; ++j) 
 	{
-	    pj_sockaddr_in *addr = &sess->srv_addr_list[cnt].ipv4;
+	    if (rec->entry[i].server.addr[j].af == sess->af) {
+		pj_sockaddr *addr = &sess->srv_addr_list[cnt];
 
-	    addr->sin_family = sess->af;
-	    addr->sin_port = pj_htons(rec->entry[i].port);
-	    addr->sin_addr.s_addr = rec->entry[i].server.addr[j].s_addr;
+		addr->addr.sa_family = sess->af;
+		pj_sockaddr_set_port(addr, rec->entry[i].port);
+		if (sess->af == pj_AF_INET6())
+		    addr->ipv6.sin6_addr = rec->entry[i].server.addr[j].ip.v6;
+		else
+		    addr->ipv4.sin_addr = rec->entry[i].server.addr[j].ip.v4;
 
-	    ++cnt;
+		++cnt;
+	    }
 	}
     }
     sess->srv_addr_cnt = (pj_uint16_t)cnt;
@@ -1737,8 +1924,13 @@ static void dns_srv_resolver_cb(void *user_data,
 
     /* Run pending allocation */
     if (sess->pending_alloc) {
-	pj_turn_session_alloc(sess, NULL);
+	pj_status_t status2;
+	status2 = pj_turn_session_alloc(sess, NULL);
+	if (status2 != PJ_SUCCESS)
+	    on_session_fail(sess, PJ_STUN_ALLOCATE_METHOD, status2, NULL);
     }
+
+    pj_grp_lock_dec_ref(sess->grp_lock);
 }
 
 
@@ -1771,14 +1963,14 @@ static struct ch_t *lookup_ch_by_addr(pj_turn_session *sess,
 	ch->expiry.sec += PJ_TURN_PERM_TIMEOUT - sess->ka_interval - 1;
 
 	if (bind_channel) {
-	    pj_uint32_t hval = 0;
+	    pj_uint32_t hval2 = 0;
 	    /* Register by channel number */
 	    pj_assert(ch->num != PJ_TURN_INVALID_CHANNEL && ch->bound);
 
 	    if (pj_hash_get(sess->ch_table, &ch->num, 
-			    sizeof(ch->num), &hval)==0) {
+			    sizeof(ch->num), &hval2)==0) {
 		pj_hash_set(sess->pool, sess->ch_table, &ch->num,
-			    sizeof(ch->num), hval, ch);
+			    sizeof(ch->num), hval2, ch);
 	    }
 	}
     }
@@ -1886,9 +2078,8 @@ static unsigned refresh_permissions(pj_turn_session *sess,
 					PJ_STUN_CREATE_PERM_REQUEST,
 					PJ_STUN_MAGIC, NULL, &tdata);
 		    if (status != PJ_SUCCESS) {
-			PJ_LOG(1,(sess->obj_name, 
-				 "Error creating CreatePermission request: %d",
-				 status));
+			PJ_PERROR(1,(sess->obj_name, status,
+				  "Error creating CreatePermission request"));
 			return 0;
 		    }
 
@@ -1931,9 +2122,8 @@ static unsigned refresh_permissions(pj_turn_session *sess,
 					  pj_sockaddr_get_len(sess->srv_addr), 
 					  tdata);
 	if (status != PJ_SUCCESS) {
-	    PJ_LOG(1,(sess->obj_name, 
-		      "Error sending CreatePermission request: %d",
-		      status));
+	    PJ_PERROR(1,(sess->obj_name, status,
+		      "Error sending CreatePermission request"));
 	    count = 0;
 	}
 

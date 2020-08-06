@@ -121,16 +121,58 @@ PJ_DEF(pj_status_t) pj_get_timestamp_freq(pj_timestamp *freq)
 }
 
 #elif defined(PJ_DARWINOS) && PJ_DARWINOS != 0
-#include <mach/mach.h>
-#include <mach/clock.h>
-#include <errno.h>
+
+/* SYSTEM_CLOCK will stop when the device is in deep sleep, so we use
+ * KERN_BOOTTIME instead. 
+ * See ticket #2140 for more details.
+ */
+#define USE_KERN_BOOTTIME 1
+
+#if USE_KERN_BOOTTIME
+#   include <sys/sysctl.h>
+#else
+#   include <mach/mach.h>
+#   include <mach/clock.h>
+#   include <errno.h>
+#endif
 
 #ifndef NSEC_PER_SEC
 #	define NSEC_PER_SEC	1000000000
 #endif
 
+#if USE_KERN_BOOTTIME
+static int64_t get_boottime()
+{
+    struct timeval boottime;
+    int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+    size_t size = sizeof(boottime);
+    int rc;
+
+    rc = sysctl(mib, 2, &boottime, &size, NULL, 0);
+    if (rc != 0)
+      return 0;
+
+    return (int64_t)boottime.tv_sec * 1000000 + (int64_t)boottime.tv_usec;
+}
+#endif
+
 PJ_DEF(pj_status_t) pj_get_timestamp(pj_timestamp *ts)
 {
+#if USE_KERN_BOOTTIME
+    int64_t before_now, after_now;
+    struct timeval now;
+
+    after_now = get_boottime();
+    do {
+        before_now = after_now;
+        gettimeofday(&now, NULL);
+        after_now = get_boottime();
+    } while (after_now != before_now);
+
+    ts->u64 = (int64_t)now.tv_sec * 1000000 + (int64_t)now.tv_usec;
+    ts->u64 -= before_now;
+    ts->u64 *= 1000;
+#else
     mach_timespec_t tp;
     int ret;
     clock_serv_t serv;
@@ -143,6 +185,79 @@ PJ_DEF(pj_status_t) pj_get_timestamp(pj_timestamp *ts)
     ret = clock_get_time(serv, &tp);
     if (ret != KERN_SUCCESS) {
 	return PJ_RETURN_OS_ERROR(EINVAL);
+    }
+
+    ts->u64 = tp.tv_sec;
+    ts->u64 *= NSEC_PER_SEC;
+    ts->u64 += tp.tv_nsec;
+#endif
+
+    return PJ_SUCCESS;
+}
+
+PJ_DEF(pj_status_t) pj_get_timestamp_freq(pj_timestamp *freq)
+{
+    freq->u32.hi = 0;
+    freq->u32.lo = NSEC_PER_SEC;
+
+    return PJ_SUCCESS;
+}
+
+#elif defined(__ANDROID__)
+
+#include <errno.h>
+#include <time.h>
+
+#if defined(PJ_HAS_ANDROID_ALARM_H) && PJ_HAS_ANDROID_ALARM_H != 0
+#  include <linux/android_alarm.h>
+#  include <fcntl.h>
+#endif
+
+#define NSEC_PER_SEC	1000000000
+
+#if defined(ANDROID_ALARM_GET_TIME)
+static int s_alarm_fd = -1;
+
+void close_alarm_fd()
+{
+    if (s_alarm_fd != -1)
+	close(s_alarm_fd);
+    s_alarm_fd = -1;
+}
+#endif
+
+PJ_DEF(pj_status_t) pj_get_timestamp(pj_timestamp *ts)
+{
+    struct timespec tp;
+    int err = -1;
+
+#if defined(ANDROID_ALARM_GET_TIME)
+    if (s_alarm_fd == -1) {
+        int fd = open("/dev/alarm", O_RDONLY);
+        if (fd >= 0) {
+	    s_alarm_fd = fd;
+	    pj_atexit(&close_alarm_fd);
+        }
+    }
+    
+    if (s_alarm_fd != -1) {
+        err = ioctl(s_alarm_fd,
+              ANDROID_ALARM_GET_TIME(ANDROID_ALARM_ELAPSED_REALTIME), &tp);
+    }
+#elif defined(CLOCK_BOOTTIME)
+    err = clock_gettime(CLOCK_BOOTTIME, &tp);
+#endif
+    
+    if (err != 0) {
+    	/* Fallback to CLOCK_MONOTONIC if /dev/alarm is not found, or
+    	 * getting ANDROID_ALARM_ELAPSED_REALTIME fails, or 
+         * CLOCK_BOOTTIME fails.
+    	 */
+        err = clock_gettime(CLOCK_MONOTONIC, &tp);
+    }
+
+    if (err != 0) {
+	return PJ_RETURN_OS_ERROR(pj_get_native_os_error());
     }
 
     ts->u64 = tp.tv_sec;

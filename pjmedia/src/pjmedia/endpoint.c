@@ -105,10 +105,10 @@ struct pjmedia_endpt
 /**
  * Initialize and get the instance of media endpoint.
  */
-PJ_DEF(pj_status_t) pjmedia_endpt_create(pj_pool_factory *pf,
-					 pj_ioqueue_t *ioqueue,
-					 unsigned worker_cnt,
-					 pjmedia_endpt **p_endpt)
+PJ_DEF(pj_status_t) pjmedia_endpt_create2(pj_pool_factory *pf,
+					  pj_ioqueue_t *ioqueue,
+					  unsigned worker_cnt,
+					  pjmedia_endpt **p_endpt)
 {
     pj_pool_t *pool;
     pjmedia_endpt *endpt;
@@ -122,7 +122,8 @@ PJ_DEF(pj_status_t) pjmedia_endpt_create(pj_pool_factory *pf,
     PJ_ASSERT_RETURN(pf && p_endpt, PJ_EINVAL);
     PJ_ASSERT_RETURN(worker_cnt <= MAX_THREADS, PJ_EINVAL);
 
-    pool = pj_pool_create(pf, "med-ept", 512, 512, NULL);
+    pool = pj_pool_create(pf, "med-ept", PJMEDIA_POOL_LEN_ENDPT,
+						PJMEDIA_POOL_INC_ENDPT, NULL);
     if (!pool)
 	return PJ_ENOMEM;
 
@@ -133,10 +134,15 @@ PJ_DEF(pj_status_t) pjmedia_endpt_create(pj_pool_factory *pf,
     endpt->thread_cnt = worker_cnt;
     endpt->has_telephone_event = PJ_TRUE;
 
-    /* Sound */
-    status = pjmedia_aud_subsys_init(pf);
-    if (status != PJ_SUCCESS)
-	goto on_error;
+    /* Initialize audio subsystem.
+     * To avoid pjmedia's dependendy on pjmedia-audiodev, the initialization
+     * (and shutdown) of audio subsystem will be done in the application
+     * level instead, when it calls inline functions pjmedia_endpt_create()
+     * and pjmedia_endpt_destroy().
+     */
+    //status = pjmedia_aud_subsys_init(pf);
+    //if (status != PJ_SUCCESS)
+    //	goto on_error;
 
     /* Init codec manager. */
     status = pjmedia_codec_mgr_init(&endpt->codec_mgr, endpt->pf);
@@ -188,7 +194,7 @@ on_error:
 	pj_ioqueue_destroy(endpt->ioqueue);
 
     pjmedia_codec_mgr_destroy(&endpt->codec_mgr);
-    pjmedia_aud_subsys_shutdown();
+    //pjmedia_aud_subsys_shutdown();
     pj_pool_release(pool);
     return status;
 }
@@ -204,7 +210,7 @@ PJ_DEF(pjmedia_codec_mgr*) pjmedia_endpt_get_codec_mgr(pjmedia_endpt *endpt)
 /**
  * Deinitialize media endpoint.
  */
-PJ_DEF(pj_status_t) pjmedia_endpt_destroy (pjmedia_endpt *endpt)
+PJ_DEF(pj_status_t) pjmedia_endpt_destroy2 (pjmedia_endpt *endpt)
 {
     exit_cb *ecb;
 
@@ -219,7 +225,7 @@ PJ_DEF(pj_status_t) pjmedia_endpt_destroy (pjmedia_endpt *endpt)
     endpt->pf = NULL;
 
     pjmedia_codec_mgr_destroy(&endpt->codec_mgr);
-    pjmedia_aud_subsys_shutdown();
+    //pjmedia_aud_subsys_shutdown();
 
     /* Call all registered exit callbacks */
     ecb = endpt->exit_cb_list.next;
@@ -411,12 +417,33 @@ PJ_DEF(pj_status_t) pjmedia_endpt_create_audio_sdp(pjmedia_endpt *endpt,
     unsigned i;
     unsigned max_bitrate = 0;
     pj_status_t status;
+#if defined(PJMEDIA_RTP_PT_TELEPHONE_EVENTS) && \
+	    PJMEDIA_RTP_PT_TELEPHONE_EVENTS != 0
+    unsigned televent_num = 0;
+    unsigned televent_clockrates[8];
+#endif
+    unsigned used_pt_num = 0;
+    unsigned used_pt[PJMEDIA_MAX_SDP_FMT];
 
     PJ_UNUSED_ARG(options);
 
     /* Check that there are not too many codecs */
     PJ_ASSERT_RETURN(endpt->codec_mgr.codec_cnt <= PJMEDIA_MAX_SDP_FMT,
 		     PJ_ETOOMANY);
+
+    /* Insert PJMEDIA_RTP_PT_TELEPHONE_EVENTS as used PT */
+#if defined(PJMEDIA_RTP_PT_TELEPHONE_EVENTS) && \
+	    PJMEDIA_RTP_PT_TELEPHONE_EVENTS != 0
+    if (endpt->has_telephone_event) {
+	used_pt[used_pt_num++] = PJMEDIA_RTP_PT_TELEPHONE_EVENTS;
+
+#  if PJMEDIA_TELEPHONE_EVENT_ALL_CLOCKRATES==0
+	televent_num = 1;
+	televent_clockrates[0] = 8000;
+#  endif
+
+    }
+#endif
 
     /* Create and init basic SDP media */
     m = PJ_POOL_ZALLOC_T(pool, pjmedia_sdp_media);
@@ -432,6 +459,7 @@ PJ_DEF(pj_status_t) pjmedia_endpt_create_audio_sdp(pjmedia_endpt *endpt,
 	char tmp_param[3];
 	pjmedia_codec_param codec_param;
 	pj_str_t *fmt;
+	unsigned pt;
 
 	if (endpt->codec_mgr.codec_desc[i].prio == PJMEDIA_CODEC_PRIO_DISABLED)
 	    break;
@@ -440,15 +468,43 @@ PJ_DEF(pj_status_t) pjmedia_endpt_create_audio_sdp(pjmedia_endpt *endpt,
 	pjmedia_codec_mgr_get_default_param(&endpt->codec_mgr, codec_info,
 					    &codec_param);
 	fmt = &m->desc.fmt[m->desc.fmt_count++];
+	pt = codec_info->pt;
+
+	/* Rearrange dynamic payload type to make sure it is inside 96-127
+	 * range and not being used by other codec/tel-event.
+	 */
+	if (pt >= 96) {
+	    unsigned pt_check = 96;
+	    unsigned j = 0;
+	    while (j < used_pt_num && pt_check <= 127) {
+		if (pt_check==used_pt[j]) {
+		    pt_check++;
+		    j = 0;
+		} else {
+		    j++;
+		}
+	    }
+	    if (pt_check > 127) {
+		/* No more available PT */
+		PJ_LOG(4,(THIS_FILE, "Warning: no available dynamic "
+			  "payload type for audio codec"));
+		break;
+	    }
+	    pt = pt_check;
+	}
+
+	/* Take a note of used dynamic PT */
+	if (pt >= 96)
+	    used_pt[used_pt_num++] = pt;
 
 	fmt->ptr = (char*) pj_pool_alloc(pool, 8);
-	fmt->slen = pj_utoa(codec_info->pt, fmt->ptr);
+	fmt->slen = pj_utoa(pt, fmt->ptr);
 
 	rtpmap.pt = *fmt;
 	rtpmap.enc_name = codec_info->encoding_name;
 
 #if defined(PJMEDIA_HANDLE_G722_MPEG_BUG) && (PJMEDIA_HANDLE_G722_MPEG_BUG != 0)
-	if (codec_info->pt == PJMEDIA_RTP_PT_G722)
+	if (pt == PJMEDIA_RTP_PT_G722)
 	    rtpmap.clock_rate = 8000;
 	else
 	    rtpmap.clock_rate = codec_info->clock_rate;
@@ -475,7 +531,7 @@ PJ_DEF(pj_status_t) pjmedia_endpt_create_audio_sdp(pjmedia_endpt *endpt,
 	    rtpmap.param.slen = 0;
 	}
 
-	if (codec_info->pt >= 96 || pjmedia_add_rtpmap_for_static_pt) {
+	if (pt >= 96 || pjmedia_add_rtpmap_for_static_pt) {
 	    pjmedia_sdp_rtpmap_to_attr(pool, &rtpmap, &attr);
 	    m->attr[m->attr_count++] = attr;
 	}
@@ -484,45 +540,45 @@ PJ_DEF(pj_status_t) pjmedia_endpt_create_audio_sdp(pjmedia_endpt *endpt,
 	if (codec_param.setting.dec_fmtp.cnt > 0) {
 	    enum { MAX_FMTP_STR_LEN = 160 };
 	    char buf[MAX_FMTP_STR_LEN];
-	    unsigned buf_len = 0, i;
+	    unsigned buf_len = 0, ii;
 	    pjmedia_codec_fmtp *dec_fmtp = &codec_param.setting.dec_fmtp;
 
 	    /* Print codec PT */
 	    buf_len += pj_ansi_snprintf(buf,
 					MAX_FMTP_STR_LEN - buf_len,
 					"%d",
-					codec_info->pt);
+					pt);
 
-	    for (i = 0; i < dec_fmtp->cnt; ++i) {
+	    for (ii = 0; ii < dec_fmtp->cnt; ++ii) {
 		pj_size_t test_len = 2;
 
 		/* Check if buf still available */
-		test_len = dec_fmtp->param[i].val.slen + 
-			   dec_fmtp->param[i].name.slen + 2;
+		test_len = dec_fmtp->param[ii].val.slen + 
+			   dec_fmtp->param[ii].name.slen + 2;
 		if (test_len + buf_len >= MAX_FMTP_STR_LEN)
 		    return PJ_ETOOBIG;
 
 		/* Print delimiter */
 		buf_len += pj_ansi_snprintf(&buf[buf_len], 
 					    MAX_FMTP_STR_LEN - buf_len,
-					    (i == 0?" ":";"));
+					    (ii == 0?" ":";"));
 
 		/* Print an fmtp param */
-		if (dec_fmtp->param[i].name.slen)
+		if (dec_fmtp->param[ii].name.slen)
 		    buf_len += pj_ansi_snprintf(
 					    &buf[buf_len],
 					    MAX_FMTP_STR_LEN - buf_len,
 					    "%.*s=%.*s",
-					    (int)dec_fmtp->param[i].name.slen,
-					    dec_fmtp->param[i].name.ptr,
-					    (int)dec_fmtp->param[i].val.slen,
-					    dec_fmtp->param[i].val.ptr);
+					    (int)dec_fmtp->param[ii].name.slen,
+					    dec_fmtp->param[ii].name.ptr,
+					    (int)dec_fmtp->param[ii].val.slen,
+					    dec_fmtp->param[ii].val.ptr);
 		else
 		    buf_len += pj_ansi_snprintf(&buf[buf_len], 
 					    MAX_FMTP_STR_LEN - buf_len,
 					    "%.*s", 
-					    (int)dec_fmtp->param[i].val.slen,
-					    dec_fmtp->param[i].val.ptr);
+					    (int)dec_fmtp->param[ii].val.slen,
+					    dec_fmtp->param[ii].val.ptr);
 	    }
 
 	    attr = PJ_POOL_ZALLOC_T(pool, pjmedia_sdp_attr);
@@ -535,29 +591,105 @@ PJ_DEF(pj_status_t) pjmedia_endpt_create_audio_sdp(pjmedia_endpt *endpt,
 	/* Find maximum bitrate in this media */
 	if (max_bitrate < codec_param.info.max_bps)
 	    max_bitrate = codec_param.info.max_bps;
+
+	/* List clock rate of audio codecs for generating telephone-event */
+#if defined(PJMEDIA_RTP_PT_TELEPHONE_EVENTS) && \
+	    PJMEDIA_RTP_PT_TELEPHONE_EVENTS != 0 && \
+	    PJMEDIA_TELEPHONE_EVENT_ALL_CLOCKRATES != 0
+	if (endpt->has_telephone_event) {
+	    unsigned j;
+
+	    for (j=0; j<televent_num; ++j) {
+		if (televent_clockrates[j] == rtpmap.clock_rate)
+		    break;
+	    }
+	    if (j==televent_num &&
+		televent_num<PJ_ARRAY_SIZE(televent_clockrates))
+	    {
+		/* List this clockrate for tel-event generation */
+		televent_clockrates[televent_num++] = rtpmap.clock_rate;
+	    }
+	}
+#endif
     }
 
 #if defined(PJMEDIA_RTP_PT_TELEPHONE_EVENTS) && \
-    PJMEDIA_RTP_PT_TELEPHONE_EVENTS != 0
+	    PJMEDIA_RTP_PT_TELEPHONE_EVENTS != 0
     /*
      * Add support telephony event
      */
     if (endpt->has_telephone_event) {
-	m->desc.fmt[m->desc.fmt_count++] =
-	    pj_str(PJMEDIA_RTP_PT_TELEPHONE_EVENTS_STR);
+	for (i=0; i<televent_num; i++) {
+	    char buf[160];
+	    unsigned j = 0;
+	    unsigned pt;
 
-	/* Add rtpmap. */
-	attr = PJ_POOL_ZALLOC_T(pool, pjmedia_sdp_attr);
-	attr->name = pj_str("rtpmap");
-	attr->value = pj_str(PJMEDIA_RTP_PT_TELEPHONE_EVENTS_STR
-			     " telephone-event/8000");
-	m->attr[m->attr_count++] = attr;
+	    /* Find PT for this tel-event */
+	    if (i == 0) {
+		/* First telephony-event always uses preconfigured PT
+		 * PJMEDIA_RTP_PT_TELEPHONE_EVENTS.
+		 */
+		pt = PJMEDIA_RTP_PT_TELEPHONE_EVENTS;
+	    } else {
+		/* Otherwise, find any free PT slot, starting from
+		 * (PJMEDIA_RTP_PT_TELEPHONE_EVENTS + 1).
+		 */
+		pt = PJMEDIA_RTP_PT_TELEPHONE_EVENTS + 1;
+		while (j < used_pt_num && pt <= 127) {
+		    if (pt == used_pt[j]) {
+			pt++;
+			j = 0;
+		    } else {
+			j++;
+		    }
+		}
+		if (pt > 127) {
+		    /* Not found? Find more, but now starting from 96 */
+		    pt = 96;
+		    j = 0;
+		    while (j < used_pt_num &&
+			   pt < PJMEDIA_RTP_PT_TELEPHONE_EVENTS)
+		    {
+			if (pt == used_pt[j]) {
+			    pt++;
+			    j = 0;
+			} else {
+			    j++;
+			}
+		    }
+		    if (pt >= PJMEDIA_RTP_PT_TELEPHONE_EVENTS) {
+			/* No more available PT */
+			PJ_LOG(4,(THIS_FILE, "Warning: no available dynamic "
+				  "payload type for telephone-event"));
+			break;
+		    }
+		}
+	    }
+	    used_pt[used_pt_num++] = pt;
 
-	/* Add fmtp */
-	attr = PJ_POOL_ZALLOC_T(pool, pjmedia_sdp_attr);
-	attr->name = pj_str("fmtp");
-	attr->value = pj_str(PJMEDIA_RTP_PT_TELEPHONE_EVENTS_STR " 0-16");
-	m->attr[m->attr_count++] = attr;
+	    /* Print tel-event PT */
+	    pj_ansi_snprintf(buf, sizeof(buf), "%d", pt);
+	    m->desc.fmt[m->desc.fmt_count++] = pj_strdup3(pool, buf);
+
+	    /* Add rtpmap. */
+	    attr = PJ_POOL_ZALLOC_T(pool, pjmedia_sdp_attr);
+	    attr->name = pj_str("rtpmap");
+	    pj_ansi_snprintf(buf, sizeof(buf), "%d telephone-event/%d",
+			     pt, televent_clockrates[i]);
+	    attr->value = pj_strdup3(pool, buf);
+	    m->attr[m->attr_count++] = attr;
+
+	    /* Add fmtp */
+	    attr = PJ_POOL_ZALLOC_T(pool, pjmedia_sdp_attr);
+	    attr->name = pj_str("fmtp");
+#if defined(PJMEDIA_HAS_DTMF_FLASH) && PJMEDIA_HAS_DTMF_FLASH!= 0
+	    pj_ansi_snprintf(buf, sizeof(buf), "%d 0-16", pt);
+#else
+	    pj_ansi_snprintf(buf, sizeof(buf), "%d 0-15", pt);
+#endif
+	    attr->value = pj_strdup3(pool, buf);
+	    m->attr[m->attr_count++] = attr;
+	}
     }
 #endif
 
@@ -755,6 +887,7 @@ PJ_DEF(pj_status_t) pjmedia_endpt_create_base_sdp( pjmedia_endpt *endpt,
 						   const pj_sockaddr *origin,
 						   pjmedia_sdp_session **p_sdp)
 {
+    char tmp_addr[PJ_INET6_ADDRSTRLEN];
     pj_time_val tv;
     pjmedia_sdp_session *sdp;
 
@@ -770,19 +903,15 @@ PJ_DEF(pj_status_t) pjmedia_endpt_create_base_sdp( pjmedia_endpt *endpt,
 
     if (origin->addr.sa_family == pj_AF_INET()) {
  	sdp->origin.addr_type = STR_IP4;
- 	pj_strdup2(pool, &sdp->origin.addr,
- 		   pj_inet_ntoa(origin->ipv4.sin_addr));
     } else if (origin->addr.sa_family == pj_AF_INET6()) {
- 	char tmp_addr[PJ_INET6_ADDRSTRLEN];
-
  	sdp->origin.addr_type = STR_IP6;
- 	pj_strdup2(pool, &sdp->origin.addr,
- 		   pj_sockaddr_print(origin, tmp_addr, sizeof(tmp_addr), 0));
-
     } else {
  	pj_assert(!"Invalid address family");
  	return PJ_EAFNOTSUP;
     }
+
+    pj_strdup2(pool, &sdp->origin.addr,
+ 	       pj_sockaddr_print(origin, tmp_addr, sizeof(tmp_addr), 0));
 
     if (sess_name)
 	pj_strdup(pool, &sdp->name, sess_name);

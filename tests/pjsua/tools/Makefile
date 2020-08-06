@@ -1,5 +1,5 @@
 #Modify this to point to the PJSIP location.
-PJBASE=~/Desktop/project/pjproject
+PJBASE=../../..
 
 include $(PJBASE)/build.mak
 
@@ -7,7 +7,7 @@ CC      = $(APP_CC)
 LDFLAGS = $(APP_LDFLAGS)
 LDLIBS  = $(APP_LDLIBS)
 CFLAGS  = $(APP_CFLAGS)
-CPPFLAGS= ${CFLAGS}
+CPPFLAGS= $(APP_CXXFLAGS)
 
 # If your application is in a file named myapp.cpp or myapp.c
 # # this is the line you will need to build the binary.

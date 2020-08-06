@@ -23,6 +23,20 @@
 
 #define THIS_FILE	"pjsua_app_legacy.c"
 
+
+/* An attempt to avoid stdout buffering for python tests:
+ * - call 'fflush(stdout)' after each call to 'printf()/puts()'
+ * - apply 'setbuf(stdout, 0)', but it is not guaranteed by the standard:
+ *   http://stackoverflow.com/questions/1716296
+ */
+#if (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L) || \
+    (defined (_MSC_VER) && _MSC_VER >= 1400)
+/* Variadic macro is introduced in C99; MSVC supports it in since 2005. */
+#  define printf(...) {printf(__VA_ARGS__);fflush(stdout);}
+#  define puts(s) {puts(s);fflush(stdout);}
+#endif
+
+
 static pj_bool_t	cmd_echo;
 
 /*
@@ -38,9 +52,9 @@ static void print_buddy_list()
 
     pjsua_enum_buddies(ids, &count);
 
-    if (count == 0)
+    if (count == 0) {
 	puts(" -none-");
-    else {
+    } else {
 	for (i=0; i<(int)count; ++i) {
 	    pjsua_buddy_info info;
 
@@ -282,6 +296,10 @@ static void vid_show_help()
     puts("| vid win show|hide ID      Show/hide the specified video window ID           |");
     puts("| vid win move ID X Y       Move window ID to position X,Y                    |");
     puts("| vid win resize ID w h     Resize window ID to the specified width, height   |");
+    puts("| vid win full on|off ID    Set fullscreen on/off for window ID               |");
+    puts("| vid conf list             List all video ports in video conference bridge   |");
+    puts("| vid conf cc P Q           Connect port P to Q in the video conf bridge      |");
+    puts("| vid conf cd P Q           Disconnect port P to Q in the video conf bridge   |");
     puts("+=============================================================================+");
     printf("| Video will be %s in the next offer/answer %s                            |\n",
 	   (vid_enabled? "enabled" : "disabled"), (vid_enabled? " " : ""));
@@ -290,7 +308,7 @@ static void vid_show_help()
 
 static void vid_handle_menu(char *menuin)
 {
-    char *argv[8];
+    char *argv[8] = {NULL};
     int argc = 0;
 
     /* Tokenize */
@@ -482,6 +500,11 @@ static void vid_handle_menu(char *menuin)
 	    status = pjsua_vid_win_set_size(wid, &size);
 	} else if (argc==3 && strcmp(argv[2], "arrange")==0) {
 	    arrange_window(PJSUA_INVALID_ID);
+	} else if (argc==5 && (strcmp(argv[2], "full")==0))
+	{
+	    pjsua_vid_win_id wid = atoi(argv[4]);
+	    pj_bool_t fullscreen = (strcmp(argv[3], "on")==0);
+	    status = pjsua_vid_win_set_fullscreen(wid, fullscreen);
 	} else
 	    goto on_error;
 
@@ -577,6 +600,80 @@ static void vid_handle_menu(char *menuin)
 		PJ_PERROR(1,(THIS_FILE, status, "Set codec size error"));
 	} else
 	    goto on_error;
+    } else if (strcmp(argv[1], "conf")==0) {
+	pj_status_t status;
+
+	if (argc==3 && strcmp(argv[2], "list")==0) {
+	    pjsua_conf_port_id id[100];
+	    unsigned count = PJ_ARRAY_SIZE(id);
+
+	    status = pjsua_vid_conf_enum_ports(id, &count);
+	    if (status != PJ_SUCCESS) {
+		PJ_PERROR(1,(THIS_FILE, status,
+			     "Failed enumerating video conf bridge ports"));
+	    } else {
+		unsigned i;
+		printf(" Video conference has %d ports:\n", count);
+		printf(" id name                   format               rx           tx    \n");
+		printf(" ------------------------------------------------------------------\n");
+		for (i=0; i<count; ++i) {
+		    char li_list[PJSUA_MAX_CALLS*4];
+		    char tr_list[PJSUA_MAX_CALLS*4];
+		    char s[32];
+		    unsigned j;
+		    pjsua_vid_conf_port_info info;
+		    pjmedia_rect_size *size;
+		    pjmedia_ratio *fps;
+
+		    pjsua_vid_conf_get_port_info(id[i], &info);
+		    size = &info.format.det.vid.size;
+		    fps = &info.format.det.vid.fps;
+
+		    li_list[0] = '\0';
+		    for (j=0; j<info.listener_cnt; ++j) {
+			char str_info[10];
+			pj_ansi_snprintf(str_info, sizeof(str_info), "%d%s",
+					 info.listeners[j],
+					 (j==info.listener_cnt-1)?"":",");
+			pj_ansi_strcat(li_list, str_info);
+		    }
+		    tr_list[0] = '\0';
+		    for (j=0; j<info.transmitter_cnt; ++j) {
+			char str_info[10];
+			pj_ansi_snprintf(str_info, sizeof(str_info), "%d%s",
+					 info.transmitters[j],
+					 (j==info.transmitter_cnt-1)?"":",");
+			pj_ansi_strcat(tr_list, str_info);
+		    }
+		    pjmedia_fourcc_name(info.format.id, s);
+		    s[4] = ' ';
+		    pj_ansi_snprintf(s+5, sizeof(s)-5, "%dx%d@%.1f",
+				     size->w, size->h,
+				     (float)(fps->num*1.0/fps->denum));
+		    printf("%3d %.*s%.*s %s%.*s %s%.*s %s\n",
+			   id[i],
+			   (int)info.name.slen, info.name.ptr,
+			   22-(int)info.name.slen, "                   ",
+			   s,
+			   20-(int)pj_ansi_strlen(s), "                    ",
+			   tr_list,
+			   12-(int)pj_ansi_strlen(tr_list), "            ",
+			   li_list);
+		}
+	    }
+	} else if (argc==5 && strcmp(argv[2], "cc")==0) {
+	    int P, Q;
+	    P = atoi(argv[3]);
+	    Q = atoi(argv[4]);
+	    pjsua_vid_conf_connect(P, Q, NULL);
+	} else if (argc==5 && strcmp(argv[2], "cd")==0) {
+	    int P, Q;
+	    P = atoi(argv[3]);
+	    Q = atoi(argv[4]);
+	    pjsua_vid_conf_disconnect(P, Q);
+	} else {
+	    goto on_error;
+	}
     } else
 	goto on_error;
 
@@ -592,7 +689,7 @@ on_error:
 static void ui_make_new_call()
 {
     char buf[128];
-    pjsua_msg_data msg_data;
+    pjsua_msg_data msg_data_;
     input_result result;
     pj_str_t tmp;
 
@@ -617,10 +714,10 @@ static void ui_make_new_call()
 	tmp.slen = 0;
     }
 
-    pjsua_msg_data_init(&msg_data);
-    TEST_MULTIPART(&msg_data);
+    pjsua_msg_data_init(&msg_data_);
+    TEST_MULTIPART(&msg_data_);
     pjsua_call_make_call(current_acc, &tmp, &call_opt, NULL,
-			 &msg_data, &current_call);
+			 &msg_data_, &current_call);
 }
 
 static void ui_make_multi_call()
@@ -743,7 +840,7 @@ static void ui_answer_call()
 {
     pjsua_call_info call_info;
     char buf[128];
-    pjsua_msg_data msg_data;
+    pjsua_msg_data msg_data_;
 
     if (current_call != -1) {
 	pjsua_call_get_info(current_call, &call_info);
@@ -775,7 +872,7 @@ static void ui_answer_call()
 	if (st_code < 100)
 	    return;
 
-	pjsua_msg_data_init(&msg_data);
+	pjsua_msg_data_init(&msg_data_);
 
 	if (st_code/100 == 3) {
 	    if (!simple_input("Enter URL to be put in Contact",
@@ -784,7 +881,7 @@ static void ui_answer_call()
 	    hvalue = pj_str(contact);
 	    pjsip_generic_string_hdr_init2(&hcontact, &hname, &hvalue);
 
-	    pj_list_push_back(&msg_data.hdr_list, &hcontact);
+	    pj_list_push_back(&msg_data_.hdr_list, &hcontact);
 	}
 
 	/*
@@ -798,7 +895,7 @@ static void ui_answer_call()
 	    return;
 	}
 
-	pjsua_call_answer2(current_call, &call_opt, st_code, NULL, &msg_data);
+	pjsua_call_answer2(current_call, &call_opt, st_code, NULL, &msg_data_);
     }
 }
 
@@ -1065,7 +1162,7 @@ static void ui_call_transfer(pj_bool_t no_refersub)
 	pj_str_t STR_FALSE = { "false", 5 };
 	pjsua_call_info ci;
 	input_result result;
-	pjsua_msg_data msg_data;
+	pjsua_msg_data msg_data_;
 
 	pjsua_call_get_info(current_call, &ci);
 	printf("Transferring current call [%d] %.*s\n", current_call,
@@ -1080,26 +1177,26 @@ static void ui_call_transfer(pj_bool_t no_refersub)
 	    return;
 	}
 
-	pjsua_msg_data_init(&msg_data);
+	pjsua_msg_data_init(&msg_data_);
 	if (no_refersub) {
 	    /* Add Refer-Sub: false in outgoing REFER request */
 	    pjsip_generic_string_hdr_init2(&refer_sub, &STR_REFER_SUB,
 		&STR_FALSE);
-	    pj_list_push_back(&msg_data.hdr_list, &refer_sub);
+	    pj_list_push_back(&msg_data_.hdr_list, &refer_sub);
 	}
 	if (result.nb_result != PJSUA_APP_NO_NB) {
-	    if (result.nb_result == -1 || result.nb_result == 0)
+	    if (result.nb_result == -1 || result.nb_result == 0) {
 		puts("You can't do that with transfer call!");
-	    else {
+	    } else {
 		pjsua_buddy_info binfo;
 		pjsua_buddy_get_info(result.nb_result-1, &binfo);
-		pjsua_call_xfer( current_call, &binfo.uri, &msg_data);
+		pjsua_call_xfer( current_call, &binfo.uri, &msg_data_);
 	    }
 
 	} else if (result.uri_result) {
 	    pj_str_t tmp;
 	    tmp = pj_str(result.uri_result);
-	    pjsua_call_xfer( current_call, &tmp, &msg_data);
+	    pjsua_call_xfer( current_call, &tmp, &msg_data_);
 	}
     }
 }
@@ -1116,7 +1213,7 @@ static void ui_call_transfer_replaces(pj_bool_t no_refersub)
 	pj_str_t STR_FALSE = { "false", 5 };
 	pjsua_call_id ids[PJSUA_MAX_CALLS];
 	pjsua_call_info ci;
-	pjsua_msg_data msg_data;
+	pjsua_msg_data msg_data_;
 	char buf[128];
 	unsigned i, count;
 
@@ -1175,17 +1272,17 @@ static void ui_call_transfer_replaces(pj_bool_t no_refersub)
 	    return;
 	}
 
-	pjsua_msg_data_init(&msg_data);
+	pjsua_msg_data_init(&msg_data_);
 	if (no_refersub) {
 	    /* Add Refer-Sub: false in outgoing REFER request */
 	    pjsip_generic_string_hdr_init2(&refer_sub, &STR_REFER_SUB,
 					   &STR_FALSE);
-	    pj_list_push_back(&msg_data.hdr_list, &refer_sub);
+	    pj_list_push_back(&msg_data_.hdr_list, &refer_sub);
 	}
 
 	pjsua_call_xfer_replaces(call, dst_call,
 				 PJSUA_XFER_NO_REQUIRE_REPLACES,
-				 &msg_data);
+				 &msg_data_);
     }
 }
 
@@ -1201,8 +1298,13 @@ static void ui_send_dtmf_2833()
 	pj_status_t status;
 	char buf[128];
 
+#if defined(PJMEDIA_HAS_DTMF_FLASH) && PJMEDIA_HAS_DTMF_FLASH!= 0	    	
 	if (!simple_input("DTMF strings to send (0-9*R#A-B)", buf,
 	    sizeof(buf)))
+#else
+	if (!simple_input("DTMF strings to send (0-9*#A-B)", buf,
+	    sizeof(buf)))
+#endif
 	{
 	    return;
 	}
@@ -1227,12 +1329,10 @@ static void ui_send_dtmf_info()
     if (current_call == -1) {
 	PJ_LOG(3,(THIS_FILE, "No current call"));
     } else {
-	const pj_str_t SIP_INFO = pj_str("INFO");
-	pj_str_t digits;
 	int call = current_call;
-	int i;
 	pj_status_t status;
 	char buf[128];
+	pjsua_call_send_dtmf_param param;
 
 	if (!simple_input("DTMF strings to send (0-9*#A-B)", buf,
 	    sizeof(buf)))
@@ -1243,27 +1343,13 @@ static void ui_send_dtmf_info()
 	if (call != current_call) {
 	    puts("Call has been disconnected");
 	    return;
-	}
-
-	digits = pj_str(buf);
-	for (i=0; i<digits.slen; ++i) {
-	    char body[80];
-	    pjsua_msg_data msg_data;
-
-	    pjsua_msg_data_init(&msg_data);
-	    msg_data.content_type = pj_str("application/dtmf-relay");
-
-	    pj_ansi_snprintf(body, sizeof(body),
-		"Signal=%c\r\n"
-		"Duration=160",
-		buf[i]);
-	    msg_data.msg_body = pj_str(body);
-
-	    status = pjsua_call_send_request(current_call, &SIP_INFO,
-		&msg_data);
-	    if (status != PJ_SUCCESS) {
-		return;
-	    }
+	}	
+	pjsua_call_send_dtmf_param_default(&param);
+	param.digits = pj_str(buf);
+	param.method = PJSUA_DTMF_METHOD_SIP_INFO;
+	status = pjsua_call_send_dtmf(current_call, &param);
+	if (status != PJ_SUCCESS) {
+	    pjsua_perror(THIS_FILE, "Error sending DTMF", status);
 	}
     }
 }
@@ -1359,7 +1445,7 @@ static void ui_sleep(char menuin[])
 	    return;
 	}
 
-	delay = pj_strtoul(&tmp);
+	delay = (int)pj_strtoul(&tmp);
 	if (delay < 0) delay = 0;
 	pj_thread_sleep(delay);
     }
@@ -1669,10 +1755,17 @@ static void ui_call_redirect(char menuin[])
     }
 }
 
+static void ui_handle_ip_change()
+{
+    pjsua_ip_change_param param;
+    pjsua_ip_change_param_default(&param);
+    pjsua_handle_ip_change(&param);
+}
+
 /*
  * Main "user interface" loop.
  */
-void legacy_main()
+void legacy_main(void)
 {
     char menuin[80];
     char buf[128];
@@ -1917,6 +2010,10 @@ void legacy_main()
 
 	case 'R':
 	    ui_call_redirect(menuin);
+	    break;
+
+	case 'I': /* Handle IP change. */
+	    ui_handle_ip_change();
 	    break;
 
 	default:

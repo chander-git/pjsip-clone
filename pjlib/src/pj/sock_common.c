@@ -129,20 +129,21 @@ PJ_DEF(pj_status_t) pj_sockaddr_in_set_str_addr( pj_sockaddr_in *addr,
 
     PJ_SOCKADDR_RESET_LEN(addr);
     addr->sin_family = PJ_AF_INET;
-    pj_bzero(addr->sin_zero, sizeof(addr->sin_zero));
+    pj_bzero(addr->sin_zero_pad, sizeof(addr->sin_zero_pad));
 
     if (str_addr && str_addr->slen) {
 	addr->sin_addr = pj_inet_addr(str_addr);
 	if (addr->sin_addr.s_addr == PJ_INADDR_NONE) {
-    	    pj_hostent he;
-	    pj_status_t rc;
+    	    pj_addrinfo ai;
+	    unsigned count = 1;
+	    pj_status_t status;
 
-	    rc = pj_gethostbyname(str_addr, &he);
-	    if (rc == 0) {
-		addr->sin_addr.s_addr = *(pj_uint32_t*)he.h_addr;
+	    status = pj_getaddrinfo(pj_AF_INET(), str_addr, &count, &ai);
+	    if (status==PJ_SUCCESS) {
+		pj_memcpy(&addr->sin_addr, &ai.ai_addr.ipv4.sin_addr,
+			  sizeof(addr->sin_addr));
 	    } else {
-		addr->sin_addr.s_addr = PJ_INADDR_NONE;
-		return rc;
+		return status;
 	    }
 	}
 
@@ -172,15 +173,20 @@ PJ_DEF(pj_status_t) pj_sockaddr_set_str_addr(int af,
     PJ_SOCKADDR_RESET_LEN(addr);
 
     if (str_addr && str_addr->slen) {
+#if defined(PJ_SOCKADDR_USE_GETADDRINFO) && PJ_SOCKADDR_USE_GETADDRINFO!=0
+	if (1) {
+#else
 	status = pj_inet_pton(PJ_AF_INET6, str_addr, &addr->ipv6.sin6_addr);
 	if (status != PJ_SUCCESS) {
+#endif
     	    pj_addrinfo ai;
 	    unsigned count = 1;
 
 	    status = pj_getaddrinfo(PJ_AF_INET6, str_addr, &count, &ai);
 	    if (status==PJ_SUCCESS) {
 		pj_memcpy(&addr->ipv6.sin6_addr, &ai.ai_addr.ipv6.sin6_addr,
-			  sizeof(pj_sockaddr_in6));
+			  sizeof(addr->ipv6.sin6_addr));
+		addr->ipv6.sin6_scope_id = ai.ai_addr.ipv6.sin6_scope_id;
 	    }
 	}
     } else {
@@ -204,7 +210,7 @@ PJ_DEF(pj_status_t) pj_sockaddr_in_init( pj_sockaddr_in *addr,
 
     PJ_SOCKADDR_RESET_LEN(addr);
     addr->sin_family = PJ_AF_INET;
-    pj_bzero(addr->sin_zero, sizeof(addr->sin_zero));
+    pj_bzero(addr->sin_zero_pad, sizeof(addr->sin_zero_pad));
     pj_sockaddr_in_set_port(addr, port);
     return pj_sockaddr_in_set_str_addr(addr, str_addr);
 }
@@ -408,6 +414,40 @@ PJ_DEF(void) pj_sockaddr_copy_addr( pj_sockaddr *dst,
 PJ_DEF(void) pj_sockaddr_cp(pj_sockaddr_t *dst, const pj_sockaddr_t *src)
 {
     pj_memcpy(dst, src, pj_sockaddr_get_len(src));
+}
+
+/*
+ * Synthesize address.
+ */
+PJ_DEF(pj_status_t) pj_sockaddr_synthesize(int dst_af,
+				           pj_sockaddr_t *dst,
+				           const pj_sockaddr_t *src)
+{
+    char ip_addr_buf[PJ_INET6_ADDRSTRLEN];
+    unsigned int count = 1;
+    pj_addrinfo ai[1];
+    pj_str_t ip_addr;
+    pj_status_t status;
+
+    /* Validate arguments */
+    PJ_ASSERT_RETURN(src && dst, PJ_EINVAL);
+
+    if (dst_af == ((const pj_sockaddr *)src)->addr.sa_family) {
+        pj_sockaddr_cp(dst, src);
+        return PJ_SUCCESS;
+    }
+
+    pj_sockaddr_print(src, ip_addr_buf, sizeof(ip_addr_buf), 0);
+    ip_addr = pj_str(ip_addr_buf);
+    
+    /* Try to synthesize address using pj_getaddrinfo(). */
+    status = pj_getaddrinfo(dst_af, &ip_addr, &count, ai); 
+    if (status == PJ_SUCCESS && count > 0) {
+    	pj_sockaddr_cp(dst, &ai[0].ai_addr);
+    	pj_sockaddr_set_port(dst, pj_sockaddr_get_port(src));
+    }
+    
+    return status;
 }
 
 /*
@@ -788,17 +828,25 @@ PJ_DEF(pj_status_t) pj_gethostip(int af, pj_sockaddr *addr)
 #if !defined(PJ_GETHOSTIP_DISABLE_LOCAL_RESOLUTION) || \
     PJ_GETHOSTIP_DISABLE_LOCAL_RESOLUTION == 0
     /* Get hostname's IP address */
-    count = 1;
-    status = pj_getaddrinfo(af, pj_gethostname(), &count, &ai);
-    if (status == PJ_SUCCESS) {
-    	pj_assert(ai.ai_addr.addr.sa_family == (pj_uint16_t)af);
-    	pj_sockaddr_copy_addr(&cand_addr[cand_cnt], &ai.ai_addr);
-	pj_sockaddr_set_port(&cand_addr[cand_cnt], 0);
-	cand_weight[cand_cnt] += WEIGHT_HOSTNAME;
-	++cand_cnt;
+    {
+	const pj_str_t *hostname = pj_gethostname();
+	count = 1;
 
-	TRACE_((THIS_FILE, "hostname IP is %s",
-		pj_sockaddr_print(&ai.ai_addr, strip, sizeof(strip), 0)));
+	if (hostname->slen > 0)
+	    status = pj_getaddrinfo(af, hostname, &count, &ai);
+	else
+	    status = PJ_ERESOLVE;
+
+	if (status == PJ_SUCCESS) {
+    	    pj_assert(ai.ai_addr.addr.sa_family == (pj_uint16_t)af);
+    	    pj_sockaddr_copy_addr(&cand_addr[cand_cnt], &ai.ai_addr);
+	    pj_sockaddr_set_port(&cand_addr[cand_cnt], 0);
+	    cand_weight[cand_cnt] += WEIGHT_HOSTNAME;
+	    ++cand_cnt;
+
+	    TRACE_((THIS_FILE, "hostname IP is %s",
+		    pj_sockaddr_print(&ai.ai_addr, strip, sizeof(strip), 3)));
+	}
     }
 #else
     PJ_UNUSED_ARG(ai);
@@ -809,7 +857,7 @@ PJ_DEF(pj_status_t) pj_gethostip(int af, pj_sockaddr *addr)
 	status = pj_getdefaultipinterface(af, addr);
 	if (status == PJ_SUCCESS) {
 	    TRACE_((THIS_FILE, "default IP is %s",
-		    pj_sockaddr_print(addr, strip, sizeof(strip), 0)));
+		    pj_sockaddr_print(addr, strip, sizeof(strip), 3)));
 
 	    pj_sockaddr_set_port(addr, 0);
 	    for (i=0; i<cand_cnt; ++i) {
@@ -921,7 +969,7 @@ PJ_DEF(pj_status_t) pj_gethostip(int af, pj_sockaddr *addr)
     selected_cand = -1;
     for (i=0; i<cand_cnt; ++i) {
 	TRACE_((THIS_FILE, "Checking candidate IP %s, weight=%d",
-		pj_sockaddr_print(&cand_addr[i], strip, sizeof(strip), 0),
+		pj_sockaddr_print(&cand_addr[i], strip, sizeof(strip), 3),
 		cand_weight[i]));
 
 	if (cand_weight[i] < MIN_WEIGHT) {
@@ -939,18 +987,18 @@ PJ_DEF(pj_status_t) pj_gethostip(int af, pj_sockaddr *addr)
 	if (af==PJ_AF_INET) {
 	    addr->ipv4.sin_addr.s_addr = pj_htonl (0x7f000001);
 	} else {
-	    pj_in6_addr *s6_addr;
+	    pj_in6_addr *s6_addr_;
 
-	    s6_addr = (pj_in6_addr*) pj_sockaddr_get_addr(addr);
-	    pj_bzero(s6_addr, sizeof(pj_in6_addr));
-	    s6_addr->s6_addr[15] = 1;
+	    s6_addr_ = (pj_in6_addr*) pj_sockaddr_get_addr(addr);
+	    pj_bzero(s6_addr_, sizeof(pj_in6_addr));
+	    s6_addr_->s6_addr[15] = 1;
 	}
 	TRACE_((THIS_FILE, "Loopback IP %s returned",
-		pj_sockaddr_print(addr, strip, sizeof(strip), 0)));
+		pj_sockaddr_print(addr, strip, sizeof(strip), 3)));
     } else {
 	pj_sockaddr_copy_addr(addr, &cand_addr[selected_cand]);
 	TRACE_((THIS_FILE, "Candidate %s selected",
-		pj_sockaddr_print(addr, strip, sizeof(strip), 0)));
+		pj_sockaddr_print(addr, strip, sizeof(strip), 3)));
     }
 
     return PJ_SUCCESS;
@@ -1141,6 +1189,40 @@ PJ_DEF(pj_status_t) pj_sock_setsockopt_sobuf( pj_sock_t sockfd,
 }
 
 
+PJ_DEF(char *) pj_addr_str_print( const pj_str_t *host_str, int port, 
+				  char *buf, int size, unsigned flag)
+{
+    enum {
+	WITH_PORT = 1
+    };
+    char *bquote, *equote;
+    int af = pj_AF_UNSPEC();    
+    pj_in6_addr dummy6;
+
+    /* Check if this is an IPv6 address */
+    if (pj_inet_pton(pj_AF_INET6(), host_str, &dummy6) == PJ_SUCCESS)
+	af = pj_AF_INET6();
+
+    if (af == pj_AF_INET6()) {
+	bquote = "[";
+	equote = "]";    
+    } else {
+	bquote = "";
+	equote = "";    
+    } 
+
+    if (flag & WITH_PORT) {
+	pj_ansi_snprintf(buf, size, "%s%.*s%s:%d",
+			 bquote, (int)host_str->slen, host_str->ptr, equote, 
+			 port);
+    } else {
+	pj_ansi_snprintf(buf, size, "%s%.*s%s",
+			 bquote, (int)host_str->slen, host_str->ptr, equote);
+    }
+    return buf;
+}
+
+
 /* Only need to implement these in DLL build */
 #if defined(PJ_DLL)
 
@@ -1242,6 +1324,11 @@ PJ_DEF(int) pj_IPTOS_RELIABILITY(void)
 PJ_DEF(int) pj_IPTOS_MINCOST(void)
 {
     return PJ_IPTOS_MINCOST;
+}
+
+PJ_DEF(int) pj_IPV6_TCLASS(void)
+{
+    return PJ_IPV6_TCLASS;
 }
 
 PJ_DEF(pj_uint16_t) pj_SO_TYPE(void)

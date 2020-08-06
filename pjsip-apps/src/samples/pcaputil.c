@@ -287,11 +287,13 @@ static void pcap2wav(const pj_str_t *codec,
 #if PJMEDIA_HAS_SRTP
     if (srtp_crypto->slen) {
 	pjmedia_srtp_crypto crypto;
+	pjmedia_transport *tp;
 
 	pj_bzero(&crypto, sizeof(crypto));
 	crypto.key = *srtp_key;
 	crypto.name = *srtp_crypto;
-	T( pjmedia_transport_srtp_create(app.mept, NULL, NULL, &app.srtp) );
+	T( pjmedia_transport_loop_create(app.mept, &tp) );
+	T( pjmedia_transport_srtp_create(app.mept, tp, NULL, &app.srtp) );
 	T( pjmedia_transport_srtp_start(app.srtp, &crypto, &crypto) );
     }
 #else
@@ -307,7 +309,7 @@ static void pcap2wav(const pj_str_t *codec,
 
     /* Get codec info and param for the specified payload type */
     app.pt = pkt0.rtp->pt;
-    if (app.pt >=0 && app.pt < 96) {
+    if (app.pt < 96) {
 	T( pjmedia_codec_mgr_get_codec_info(cmgr, pkt0.rtp->pt, &ci) );
     } else {
 	unsigned cnt = 2;
@@ -371,8 +373,6 @@ static void pcap2wav(const pj_str_t *codec,
 	/* Decode and write to WAV file */
 	samples_cnt = 0;
 	for (i=0; i<frame_cnt; ++i) {
-	    pjmedia_frame pcm_frame;
-
 	    pcm_frame.buf = pcm;
 	    pcm_frame.size = samples_per_frame * 2;
 

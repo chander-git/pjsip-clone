@@ -138,6 +138,17 @@ PJ_DEF(pj_status_t) pj_stun_client_tsx_schedule_destroy(
 }
 
 
+PJ_DEF(pj_status_t) pj_stun_client_tsx_destroy(pj_stun_client_tsx *tsx)
+{
+    /*
+     * Currently tsx has no objects to destroy so we don't need to do anything
+     * here.
+     */
+    /* pj_stun_client_tsx_stop(tsx); */
+    PJ_UNUSED_ARG(tsx);
+    return PJ_SUCCESS;
+}
+
 /*
  * Destroy transaction immediately.
  */
@@ -247,11 +258,13 @@ static pj_status_t tsx_transmit_msg(pj_stun_client_tsx *tsx,
 
     /* Send message */
     status = tsx->cb.on_send_msg(tsx, tsx->last_pkt, tsx->last_pkt_size);
+    if (status == PJ_EPENDING || status == PJ_EBUSY)
+    	status = PJ_SUCCESS;
 
     if (status == PJNATH_ESTUNDESTROYED) {
 	/* We've been destroyed, don't access the object. */
     } else if (status != PJ_SUCCESS) {
-	if (mod_count) {
+	if (mod_count || status == PJ_EINVALIDOP) {
 		pj_timer_heap_cancel_if_active( tsx->timer_heap,
 	                               		&tsx->retransmit_timer,
 	                               		TIMER_INACTIVE);

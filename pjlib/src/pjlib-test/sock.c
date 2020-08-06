@@ -162,11 +162,11 @@ static int format_test(void)
 #endif	/* PJ_HAS_IPV6 */
 
     /* Test that pj_sockaddr_in_init() initialize the whole structure, 
-     * including sin_zero.
+     * including sin_zero_pad.
      */
     pj_sockaddr_in_init(&addr2, 0, 1000);
     pj_bzero(zero, sizeof(zero));
-    if (pj_memcmp(addr2.sin_zero, zero, sizeof(addr2.sin_zero)) != 0)
+    if (pj_memcmp(addr2.sin_zero_pad, zero, sizeof(addr2.sin_zero_pad)) != 0)
 	return -35;
 
     /* pj_gethostname() */
@@ -424,8 +424,8 @@ static int purity_test(void)
 	cnt = PJ_ARRAY_SIZE(ai);
 	rc = pj_getaddrinfo(pj_AF_UNSPEC(), &str_ip, &cnt, ai);
 	if (rc == PJ_SUCCESS) {
-	    pj_assert(cnt == 1);
-	    CHECK_SA_ZERO_LEN(&ai[0].ai_addr, -70);
+	    while (cnt--)
+		CHECK_SA_ZERO_LEN(&ai[cnt].ai_addr, -70);
 	}
     }
 #endif
@@ -758,6 +758,8 @@ static int gethostbyname_test(void)
     pj_str_t host;
     pj_hostent he;
     pj_status_t status;
+
+    PJ_LOG(3,("test", "...gethostbyname_test()"));
 
     /* Testing pj_gethostbyname() with invalid host */
     host = pj_str("an-invalid-host-name");

@@ -50,8 +50,10 @@ SAMPLES := auddemo \
 
 PJSUA2_SAMPLES := pjsua2_demo
 
+ifeq ($(EXCLUDE_APP),0)
 EXES := $(foreach file, $(SAMPLES), $(file)$(HOST_EXE))
 PJSUA2_EXES := $(foreach file, $(PJSUA2_SAMPLES), $(file)$(HOST_EXE))
+endif
 
 .PHONY: $(EXES)
 .PHONY: $(PJSUA2_EXES)

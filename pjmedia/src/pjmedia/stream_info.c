@@ -23,15 +23,53 @@
 #include <pj/ctype.h>
 #include <pj/rand.h>
 
-static const pj_str_t ID_AUDIO = { "audio", 5};
 static const pj_str_t ID_IN = { "IN", 2 };
 static const pj_str_t ID_IP4 = { "IP4", 3};
 static const pj_str_t ID_IP6 = { "IP6", 3};
-static const pj_str_t ID_RTP_AVP = { "RTP/AVP", 7 };
-static const pj_str_t ID_RTP_SAVP = { "RTP/SAVP", 8 };
 //static const pj_str_t ID_SDP_NAME = { "pjmedia", 7 };
 static const pj_str_t ID_RTPMAP = { "rtpmap", 6 };
 static const pj_str_t ID_TELEPHONE_EVENT = { "telephone-event", 15 };
+
+static void get_opus_channels_and_clock_rate(const pjmedia_codec_fmtp *enc_fmtp,
+					     const pjmedia_codec_fmtp *dec_fmtp,
+					     unsigned *channel_cnt,
+					     unsigned *clock_rate)
+{
+    unsigned i;
+    unsigned enc_channel_cnt = 0, local_channel_cnt = 0;
+    unsigned enc_clock_rate = 0, local_clock_rate = 0;
+
+    for (i = 0; i < dec_fmtp->cnt; ++i) {
+	if (!pj_stricmp2(&dec_fmtp->param[i].name, "sprop-maxcapturerate")) {
+	    local_clock_rate = (unsigned)pj_strtoul(&dec_fmtp->param[i].val);
+	} else if (!pj_stricmp2(&dec_fmtp->param[i].name, "sprop-stereo")) {
+	    local_channel_cnt = (unsigned)pj_strtoul(&dec_fmtp->param[i].val);
+	    local_channel_cnt = (local_channel_cnt > 0) ? 2 : 1;
+	}
+    }
+    if (!local_clock_rate) local_clock_rate = *clock_rate;
+    if (!local_channel_cnt) local_channel_cnt = *channel_cnt;
+
+    for (i = 0; i < enc_fmtp->cnt; ++i) {
+	if (!pj_stricmp2(&enc_fmtp->param[i].name, "maxplaybackrate")) {
+	    enc_clock_rate = (unsigned)pj_strtoul(&enc_fmtp->param[i].val);
+	} else if (!pj_stricmp2(&enc_fmtp->param[i].name, "stereo")) {
+	    enc_channel_cnt = (unsigned)pj_strtoul(&enc_fmtp->param[i].val);
+	    enc_channel_cnt = (enc_channel_cnt > 0) ? 2 : 1;
+	}
+    }
+    /* The default is a standard mono session with 48000 Hz clock rate
+     * (RFC 7587, section 7)
+     */
+    if (!enc_clock_rate) enc_clock_rate = 48000;
+    if (!enc_channel_cnt) enc_channel_cnt = 1;
+
+    *clock_rate = (enc_clock_rate < local_clock_rate) ? enc_clock_rate :
+		  local_clock_rate;
+
+    *channel_cnt = (enc_channel_cnt < local_channel_cnt) ? enc_channel_cnt :
+		   local_channel_cnt;
+}
 
 /*
  * Internal function for collecting codec info and param from the SDP media.
@@ -218,6 +256,14 @@ static pj_status_t get_audio_codec_info_param(pjmedia_stream_info *si,
     pjmedia_stream_info_parse_fmtp(pool, local_m, si->rx_pt,
 				   &si->param->setting.dec_fmtp);
 
+    if (!pj_stricmp2(&si->fmt.encoding_name, "opus")) {
+	get_opus_channels_and_clock_rate(&si->param->setting.enc_fmtp,
+					 &si->param->setting.dec_fmtp,
+					 &si->fmt.channel_cnt,
+					 &si->fmt.clock_rate);
+    }
+
+
     /* Get the remote ptime for our encoder. */
     attr = pjmedia_sdp_attr_find2(rem_m->attr_count, rem_m->attr,
 				  "ptime", NULL);
@@ -317,6 +363,7 @@ PJ_DEF(pj_status_t) pjmedia_stream_info_from_sdp(
     const pjmedia_sdp_conn *rem_conn;
     int rem_af, local_af;
     pj_sockaddr local_addr;
+    unsigned i;
     pj_status_t status;
 
 
@@ -338,7 +385,7 @@ PJ_DEF(pj_status_t) pjmedia_stream_info_from_sdp(
 	return PJMEDIA_SDP_EMISSINGCONN;
 
     /* Media type must be audio */
-    if (pj_stricmp(&local_m->desc.media, &ID_AUDIO) != 0)
+    if (pjmedia_get_type(&local_m->desc.media) != PJMEDIA_TYPE_AUDIO)
 	return PJMEDIA_EINVALIMEDIATYPE;
 
     /* Get codec manager. */
@@ -366,20 +413,12 @@ PJ_DEF(pj_status_t) pjmedia_stream_info_from_sdp(
     if (status != PJ_SUCCESS)
 	return PJMEDIA_SDPNEG_EINVANSTP;
 
-    if (pj_stricmp(&local_m->desc.transport, &ID_RTP_AVP) == 0) {
+    /* Get the transport protocol */
+    si->proto = pjmedia_sdp_transport_get_proto(&local_m->desc.transport);
 
-	si->proto = PJMEDIA_TP_PROTO_RTP_AVP;
-
-    } else if (pj_stricmp(&local_m->desc.transport, &ID_RTP_SAVP) == 0) {
-
-	si->proto = PJMEDIA_TP_PROTO_RTP_SAVP;
-
-    } else {
-
-	si->proto = PJMEDIA_TP_PROTO_UNKNOWN;
+    /* Just return success if stream is not RTP/AVP compatible */
+    if (!PJMEDIA_TP_PROTO_HAS_FLAG(si->proto, PJMEDIA_TP_PROTO_RTP_AVP))
 	return PJ_SUCCESS;
-    }
-
 
     /* Check address family in remote SDP */
     rem_af = pj_AF_UNSPEC();
@@ -427,9 +466,17 @@ PJ_DEF(pj_status_t) pjmedia_stream_info_from_sdp(
 	return PJMEDIA_EINVALIDIP;
     }
 
-    /* Local and remote address family must match */
-    if (local_af != rem_af)
-	return PJ_EAFNOTSUP;
+    /* Local and remote address family must match, except when ICE is used
+     * by both sides (see also ticket #1952).
+     */
+    if (local_af != rem_af) {
+	const pj_str_t STR_ICE_CAND = { "candidate", 9 };
+	if (pjmedia_sdp_media_find_attr(rem_m, &STR_ICE_CAND, NULL)==NULL ||
+	    pjmedia_sdp_media_find_attr(local_m, &STR_ICE_CAND, NULL)==NULL)
+	{
+	    return PJ_EAFNOTSUP;
+	}
+    }
 
     /* Media direction: */
 
@@ -467,6 +514,12 @@ PJ_DEF(pj_status_t) pjmedia_stream_info_from_sdp(
 	return PJ_SUCCESS;
     }
 
+    /* Check if "rtcp-mux" is present in the SDP. */
+    attr = pjmedia_sdp_attr_find2(rem_m->attr_count, rem_m->attr,
+    				  "rtcp-mux", NULL);
+    if (attr)
+    	si->rtcp_mux = PJ_TRUE;
+
     /* If "rtcp" attribute is present in the SDP, set the RTCP address
      * from that attribute. Otherwise, calculate from RTP address.
      */
@@ -497,6 +550,23 @@ PJ_DEF(pj_status_t) pjmedia_stream_info_from_sdp(
 	pj_sockaddr_set_port(&si->rem_rtcp, (pj_uint16_t)rtcp_port);
     }
 
+    /* Check if "ssrc" attribute is present in the SDP. */
+    for (i = 0; i < rem_m->attr_count; i++) {
+	if (pj_strcmp2(&rem_m->attr[i]->name, "ssrc") == 0) {
+	    pjmedia_sdp_ssrc_attr ssrc;
+
+	    status = pjmedia_sdp_attr_get_ssrc(
+	    		(const pjmedia_sdp_attr *)rem_m->attr[i], &ssrc);
+	    if (status == PJ_SUCCESS) {
+	        si->has_rem_ssrc = PJ_TRUE;
+	    	si->rem_ssrc = ssrc.ssrc;
+	    	if (ssrc.cname.slen > 0) {
+	    	    pj_strdup(pool, &si->rem_cname, &ssrc.cname);
+	    	    break;
+	    	}
+	    }
+	}
+    }
 
     /* Get the payload number for receive channel. */
     /*
@@ -520,12 +590,26 @@ PJ_DEF(pj_status_t) pjmedia_stream_info_from_sdp(
 
     /* Get codec info and param */
     status = get_audio_codec_info_param(si, pool, mgr, local_m, rem_m);
+    if (status != PJ_SUCCESS)
+	return status;
 
     /* Leave SSRC to random. */
     si->ssrc = pj_rand();
 
     /* Set default jitter buffer parameter. */
     si->jb_init = si->jb_max = si->jb_min_pre = si->jb_max_pre = -1;
+
+    /* Get local RTCP-FB info */
+    status = pjmedia_rtcp_fb_decode_sdp2(pool, endpt, NULL, local, stream_idx,
+					 si->rx_pt, &si->loc_rtcp_fb);
+    if (status != PJ_SUCCESS)
+	return status;
+
+    /* Get remote RTCP-FB info */
+    status = pjmedia_rtcp_fb_decode_sdp2(pool, endpt, NULL, remote, stream_idx,
+					 si->tx_pt, &si->rem_rtcp_fb);
+    if (status != PJ_SUCCESS)
+	return status;
 
     return status;
 }

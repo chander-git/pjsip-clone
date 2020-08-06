@@ -104,12 +104,20 @@ static const char *desc =
 #define DEF_RENDERER_HEIGHT		    480
 
 
-/* Prototype */
-static void print_stream_stat(pjmedia_vid_stream *stream,
-			      const pjmedia_vid_codec_param *codec_param);
-
-/* Prototype for LIBSRTP utility in file datatypes.c */
-int hex_string_to_octet_string(char *raw, char *hex, int len);
+/* Hexa string to octet array */
+int my_hex_string_to_octet_string(char *raw, char *hex, int len)
+{
+    int i;
+    for (i = 0; i < len; i+=2) {
+	int tmp;
+	if (i+1 >= len || !pj_isxdigit(hex[i]) || !pj_isxdigit(hex[i+1]))
+	    return i;
+	tmp  = pj_hex_digit_to_val((unsigned char)hex[i]) << 4;
+	tmp |= pj_hex_digit_to_val((unsigned char)hex[i+1]);
+	raw[i/2] = (char)(tmp & 0xFF);
+    }
+    return len;
+}
 
 /* 
  * Register all codecs. 
@@ -123,6 +131,17 @@ static pj_status_t init_codecs(pj_pool_factory *pf)
 
 #if defined(PJMEDIA_HAS_OPENH264_CODEC) && PJMEDIA_HAS_OPENH264_CODEC != 0
     status = pjmedia_codec_openh264_vid_init(NULL, pf);
+    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
+#endif
+
+#if defined(PJMEDIA_HAS_VID_TOOLBOX_CODEC) && \
+    PJMEDIA_HAS_VID_TOOLBOX_CODEC != 0
+    status = pjmedia_codec_vid_toolbox_init(NULL, pf);
+    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
+#endif
+
+#if defined(PJMEDIA_HAS_VPX_CODEC) && PJMEDIA_HAS_VPX_CODEC != 0
+    status = pjmedia_codec_vpx_vid_init(NULL, pf);
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
 #endif
 
@@ -145,6 +164,15 @@ static void deinit_codecs()
 
 #if defined(PJMEDIA_HAS_OPENH264_CODEC) && PJMEDIA_HAS_OPENH264_CODEC != 0
     pjmedia_codec_openh264_vid_deinit();
+#endif
+
+#if defined(PJMEDIA_HAS_VID_TOOLBOX_CODEC) && \
+    PJMEDIA_HAS_VID_TOOLBOX_CODEC != 0
+    pjmedia_codec_vid_toolbox_deinit();
+#endif
+
+#if defined(PJMEDIA_HAS_VPX_CODEC) && PJMEDIA_HAS_VPX_CODEC != 0
+    pjmedia_codec_vpx_vid_deinit();
 #endif
 
 }
@@ -273,6 +301,8 @@ static pj_status_t create_stream( pj_pool_t *pool,
 	return status;
     }
 
+    /* Start media transport */
+    pjmedia_transport_media_start(transport, 0, 0, 0, 0);
 
     return PJ_SUCCESS;
 }
@@ -347,6 +377,7 @@ int main(int argc, char *argv[])
     pj_pool_t *pool;
     pjmedia_vid_stream *stream = NULL;
     pjmedia_port *enc_port, *dec_port;
+    char addr[PJ_INET_ADDRSTRLEN];
     pj_status_t status; 
 
     pjmedia_vid_port *capture=NULL, *renderer=NULL;
@@ -504,14 +535,14 @@ int main(int argc, char *argv[])
 	    break;
 
 	case OPT_SRTP_TX_KEY:
-	    tmp_key_len = hex_string_to_octet_string(tmp_tx_key, pj_optarg, 
-						     (int)strlen(pj_optarg));
+	    tmp_key_len = my_hex_string_to_octet_string(tmp_tx_key, pj_optarg, 
+						        (int)strlen(pj_optarg));
 	    pj_strset(&srtp_tx_key, tmp_tx_key, tmp_key_len/2);
 	    break;
 
 	case OPT_SRTP_RX_KEY:
-	    tmp_key_len = hex_string_to_octet_string(tmp_rx_key, pj_optarg,
-						     (int)strlen(pj_optarg));
+	    tmp_key_len = my_hex_string_to_octet_string(tmp_rx_key, pj_optarg,
+						        (int)strlen(pj_optarg));
 	    pj_strset(&srtp_rx_key, tmp_rx_key, tmp_key_len/2);
 	    break;
 #endif
@@ -859,13 +890,15 @@ int main(int argc, char *argv[])
 	       local_port);
     else if (dir == PJMEDIA_DIR_ENCODING)
 	printf("Stream is active, dir is send-only, sending to %s:%d\n",
-	       pj_inet_ntoa(remote_addr.sin_addr),
+               pj_inet_ntop2(pj_AF_INET(), &remote_addr.sin_addr, addr,
+        		     sizeof(addr)),
 	       pj_ntohs(remote_addr.sin_port));
     else
 	printf("Stream is active, send/recv, local port is %d, "
 	       "sending to %s:%d\n",
 	       local_port,
-	       pj_inet_ntoa(remote_addr.sin_addr),
+	       pj_inet_ntop2(pj_AF_INET(), &remote_addr.sin_addr, addr,
+        		     sizeof(addr)),
 	       pj_ntohs(remote_addr.sin_port));
 
     if (dir & PJMEDIA_DIR_ENCODING)
@@ -937,6 +970,7 @@ on_exit:
 	tp = pjmedia_vid_stream_get_transport(stream);
 	pjmedia_vid_stream_destroy(stream);
 	
+	pjmedia_transport_media_stop(tp);
 	pjmedia_transport_close(tp);
     }
 

@@ -173,7 +173,7 @@ static unsigned fps_to_mpi(const pjmedia_ratio *fps)
     if (mpi < 1) mpi = 1;
 
     return mpi;
-};
+}
 
 PJ_DEF(pj_status_t) pjmedia_vid_codec_h263_apply_fmtp(
 				pjmedia_vid_codec_param *param)
@@ -399,7 +399,7 @@ PJ_DEF(pj_status_t) pjmedia_vid_codec_h264_parse_fmtp(
 		return status;
 	} else if (pj_stricmp(&fmtp->param[i].name, &PACKETIZATION_MODE)==0) {
 	    tmp = pj_strtoul(&fmtp->param[i].val);
-	    if (tmp >= 0 && tmp <= 2) 
+	    if (tmp <= 2) 
 		h264_fmtp->packetization_mode = (pj_uint8_t)tmp;
 	    else
 		return PJMEDIA_SDP_EINFMTP;
@@ -429,7 +429,6 @@ PJ_DEF(pj_status_t) pjmedia_vid_codec_h264_parse_fmtp(
 		const pj_uint8_t start_code[3] = {0, 0, 1};
 		char *p;
 		pj_uint8_t *nal;
-		pj_status_t status;
 
 		/* Find field separator ',' */
 		tmp_st = sps_st;
@@ -757,6 +756,119 @@ PJ_DEF(pj_status_t) pjmedia_vid_codec_h264_apply_fmtp(
 	    vfd->avg_bps = fmtp.max_br * 1000;
 	if (vfd->max_bps < fmtp.max_br * 1000)
 	    vfd->max_bps = fmtp.max_br * 1000;
+    }
+
+    return PJ_SUCCESS;
+}
+
+
+/* VPX fmtp parser */
+PJ_DEF(pj_status_t) pjmedia_vid_codec_vpx_parse_fmtp(
+				    const pjmedia_codec_fmtp *fmtp,
+				    pjmedia_vid_codec_vpx_fmtp *vpx_fmtp)
+{
+    const pj_str_t PROFILE_ID	= {"profile-id", 10};
+    const pj_str_t MAX_FR	= {"max-fr", 6};
+    const pj_str_t MAX_FS	= {"max-fs", 6};
+
+    unsigned i;
+
+    pj_bzero(vpx_fmtp, sizeof(*vpx_fmtp));
+
+    for (i = 0; i < fmtp->cnt; ++i) {
+    	unsigned tmp;
+
+	if (pj_stricmp(&fmtp->param[i].name, &MAX_FS) == 0) {
+	    tmp = pj_strtoul(&fmtp->param[i].val);
+	    vpx_fmtp->max_fs = PJ_MAX(tmp, vpx_fmtp->max_fs);
+	} else if (pj_stricmp(&fmtp->param[i].name, &MAX_FR) == 0) {
+	    tmp = pj_strtoul(&fmtp->param[i].val);
+	    vpx_fmtp->max_fr = PJ_MAX(tmp, vpx_fmtp->max_fr);
+	} else if (pj_stricmp(&fmtp->param[i].name, &PROFILE_ID) == 0) {
+	    tmp = pj_strtoul(&fmtp->param[i].val);
+	    vpx_fmtp->profile_id = (pj_uint8_t)
+				   PJ_MAX(tmp, vpx_fmtp->profile_id);
+	}
+    }
+
+    return PJ_SUCCESS;
+}
+
+
+PJ_DEF(pj_status_t) pjmedia_vid_codec_vpx_apply_fmtp(
+				pjmedia_vid_codec_param *param)
+{
+    if (param->dir & PJMEDIA_DIR_ENCODING) {
+	pjmedia_vid_codec_vpx_fmtp fmtp;
+	pjmedia_video_format_detail *vfd;
+	pj_status_t status;
+
+	/* Get remote param */
+	status = pjmedia_vid_codec_vpx_parse_fmtp(&param->enc_fmtp,
+						  &fmtp);
+	if (status != PJ_SUCCESS)
+	    return status;
+
+	/* Adjust fps and size to conform to the parameter
+	 * specified by remote SDP fmtp.
+	 */
+	vfd = pjmedia_format_get_video_format_detail(&param->enc_fmt,
+						     PJ_TRUE);
+
+	if (fmtp.max_fr > 0) {
+	    if ((float)vfd->fps.num/vfd->fps.denum > (float)fmtp.max_fr) {
+	    	vfd->fps.num   = fmtp.max_fr;
+	    	vfd->fps.denum = 1;
+	    }
+	}
+	
+	if (fmtp.max_fs > 0) {
+	    unsigned max_res = ((int)pj_isqrt(fmtp.max_fs * 8)) * 16;
+	    
+	    if (vfd->size.w > max_res || vfd->size.h > max_res) {
+	        /* Here we maintain the aspect ratio. Or should we scale down
+	         * to some predetermined resolution instead (for example,
+	         * if the requested resolution is 640x480 and max_res is
+	         * 600, should we scale down to 480x360)?
+	         */
+	    	unsigned larger = (vfd->size.w > vfd->size.h)?
+	    			  vfd->size.w: vfd->size.h;
+	    	float scale = (float)max_res/larger;
+
+	    	vfd->size.w = (int)(scale * vfd->size.w);
+	    	vfd->size.h = (int)(scale * vfd->size.h);
+	    }
+	}
+    }
+
+    if (param->dir & PJMEDIA_DIR_DECODING) {
+	/* Here we just want to find the highest fps and resolution possible
+	 * from the fmtp and set it as the decoder param.
+	 */
+	pjmedia_vid_codec_vpx_fmtp fmtp;
+	pjmedia_video_format_detail *vfd;
+	pj_status_t status;
+
+	/* Get remote param */
+	status = pjmedia_vid_codec_vpx_parse_fmtp(&param->dec_fmtp,
+						  &fmtp);
+	if (status != PJ_SUCCESS)
+	    return status;
+
+	vfd = pjmedia_format_get_video_format_detail(&param->dec_fmt,
+						     PJ_TRUE);
+
+	if (fmtp.max_fr > 0) {
+	    vfd->fps.num   = fmtp.max_fr;
+	    vfd->fps.denum = 1;
+	}
+	
+	if (fmtp.max_fs > 0) {
+	    unsigned max_res = ((int)pj_isqrt(fmtp.max_fs * 8)) * 16;
+	    
+	    vfd->size.w = max_res;
+	    vfd->size.h = max_res;
+	}
     }
 
     return PJ_SUCCESS;

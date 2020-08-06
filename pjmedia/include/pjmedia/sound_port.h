@@ -27,6 +27,7 @@
 #include <pjmedia-audiodev/audiodev.h>
 #include <pjmedia/clock.h>
 #include <pjmedia/port.h>
+#include <pjmedia/echo.h>
 
 PJ_BEGIN_DECL
 
@@ -95,6 +96,38 @@ typedef struct pjmedia_snd_port_param
      * Echo cancellation options/flags.
      */
     unsigned ec_options;
+
+    /**
+     * Arbitrary user data for playback and record preview callbacks below.
+     */
+    void *user_data;
+
+    /**
+     * Optional callback for audio frame preview right before queued to
+     * the speaker.
+     * Notes:
+     * - application MUST NOT block or perform long operation in the callback
+     *   as the callback may be executed in sound device thread
+     * - when using software echo cancellation, application MUST NOT modify
+     *   the audio data from within the callback, otherwise the echo canceller
+     *   will not work properly.
+     * - the return value of the callback will be ignored
+     */
+    pjmedia_aud_play_cb on_play_frame;
+
+    /**
+     * Optional callback for audio frame preview recorded from the microphone
+     * before being processed by any media component such as software echo
+     * canceller.
+     * Notes:
+     * - application MUST NOT block or perform long operation in the callback
+     *   as the callback may be executed in sound device thread
+     * - when using software echo cancellation, application MUST NOT modify
+     *   the audio data from within the callback, otherwise the echo canceller
+     *   will not work properly.
+     * - the return value of the callback will be ignored
+     */
+    pjmedia_aud_rec_cb on_rec_frame;
 
 } pjmedia_snd_port_param;
 
@@ -282,6 +315,19 @@ PJ_DECL(pj_status_t) pjmedia_snd_port_set_ec( pjmedia_snd_port *snd_port,
  */
 PJ_DECL(pj_status_t) pjmedia_snd_port_get_ec_tail(pjmedia_snd_port *snd_port,
 						  unsigned *p_length);
+
+
+/**
+ * Get echo canceller statistics.
+ *
+ * @param snd_port	    The sound device port.
+ * @param p_stat	    Pointer to receive the stat.
+ *
+ * @return		    PJ_SUCCESS on success, or the appropriate error
+ *			    code.
+ */
+PJ_DECL(pj_status_t) pjmedia_snd_port_get_ec_stat(pjmedia_snd_port *snd_port,
+						  pjmedia_echo_stat *p_stat);
 
 
 /**

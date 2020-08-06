@@ -1,12 +1,30 @@
 PYTHON_SO=_pjsua2.so
 
+USE_PYTHON3?=1
+
+ifeq ($(USE_PYTHON3),1)
+  PYTHON_EXE=python3
+else
+  PYTHON_EXE=python2
+endif
+
 #PYTHON_SETUP_FLAGS = --inplace 
 ifeq ($(OS),Windows_NT)
+  PYTHON_PKG_DIR := $(shell $(PYTHON_EXE) -m site --user-site | sed 's/\\/\//g')
   PYTHON_SETUP_FLAGS += --compiler=mingw32
   GCC_EXE=gcc.exe
 else
+  PYTHON_PKG_DIR := $(shell $(PYTHON_EXE) -m site --user-site)
   GCC_EXE=
 endif
+
+SWIG_FLAGS=-I../../../../pjlib/include \
+		   -I../../../../pjlib-util/include \
+		   -I../../../../pjmedia/include \
+		   -I../../../../pjsip/include \
+		   -I../../../../pjnath/include -c++ 
+SRC_DIR=../../../../pjsip/include
+SRCS=$(SRC_DIR)/pjsua2/endpoint.hpp $(SRC_DIR)/pjsua2/types.hpp
 
 #USE_THREADS = -threads -DSWIG_NO_EXPORT_ITERATOR_METHODS
 SWIG_FLAGS += -w312 $(USE_THREADS)
@@ -16,7 +34,7 @@ SWIG_FLAGS += -w312 $(USE_THREADS)
 all: $(PYTHON_SO)
 
 $(PYTHON_SO): pjsua2_wrap.cpp setup.py $(GCC_EXE)
-	python setup.py build $(PYTHON_SETUP_FLAGS)
+	$(PYTHON_EXE) setup.py build $(PYTHON_SETUP_FLAGS)
 
 gcc.exe: cc_mingw.c
 	gcc -o gcc.exe cc_mingw.c
@@ -30,9 +48,9 @@ clean distclean realclean:
 	rm -f gcc.exe g++.exe
 
 install:
-	python setup.py install --user
+	$(PYTHON_EXE) setup.py install --user
 
 uninstall:
-	rm -f $(HOME)/.local/lib/python2.7/site-packages/pjsua2*
-	rm -f $(HOME)/.local/lib/python2.7/site-packages/_pjsua2*
+	rm -f $(PYTHON_PKG_DIR)/pjsua2*
+	rm -f $(PYTHON_PKG_DIR)/_pjsua2*
 

@@ -36,6 +36,10 @@
     (defined(PJ_WIN64) && PJ_WIN64!=0) || \
     (defined(PJ_WIN32_WINCE) && PJ_WIN32_WINCE!=0)
 
+/* Undefine EADDRINUSE first, we want it equal to WSAEADDRINUSE,
+ * while WinSDK 10 defines it to another value.
+ */
+#undef EADDRINUSE
 #define EADDRINUSE WSAEADDRINUSE
 
 #endif
@@ -785,7 +789,7 @@ static void send_ambi_arg(cli_telnet_sess *sess,
     pj_strcat2(&send_data, "^");
     /* Get the max length of the command name */
     for (i=0;i<info->hint_cnt;++i) {
-	if ((&hint[i].type) && (hint[i].type.slen > 0)) {
+	if (hint[i].type.slen > 0) {
 	    if (pj_stricmp(&hint[i].type, &sc_type) == 0) {
 		if ((i > 0) && (!pj_stricmp(&hint[i-1].desc, &hint[i].desc))) {
 		    cmd_length += (hint[i].name.slen + 3);
@@ -807,7 +811,7 @@ static void send_ambi_arg(cli_telnet_sess *sess,
     cmd_length = 0;
     /* Build hint information */
     for (i=0;i<info->hint_cnt;++i) {
-	if ((&hint[i].type) && (hint[i].type.slen > 0)) {
+	if (hint[i].type.slen > 0) {
 	    if (pj_stricmp(&hint[i].type, &sc_type) == 0) {
 		parse_state = OP_SHORTCUT;
 	    } else if (pj_stricmp(&hint[i].type, &choice_type) == 0) {
@@ -967,6 +971,8 @@ static pj_status_t get_last_token(pj_str_t *cmd, pj_str_t *str)
 	return PJ_GET_EXCEPTION();
     }
     PJ_END;
+    
+    pj_scan_fini(&scanner);
     return PJ_SUCCESS;
 }
 
@@ -1328,6 +1334,7 @@ static pj_status_t telnet_sess_send_with_format(cli_telnet_sess *sess,
     }
     PJ_END;
 
+    pj_scan_fini(&scanner);
     return PJ_SUCCESS;
 }
 
@@ -1369,7 +1376,7 @@ static void telnet_fe_write_log(pj_cli_front_end *fe, int level,
         cli_telnet_sess *tsess = (cli_telnet_sess *)sess;
 
         sess = sess->next;
-	if (tsess->base.log_level > level) {
+	if (tsess->base.log_level >= level) {
 	    pj_str_t s;
 
 	    pj_strset(&s, (char *)data, len);
@@ -1487,13 +1494,14 @@ static pj_bool_t telnet_sess_on_data_read(pj_activesock_t *asock,
     switch (sess->parse_state) {
 	case ST_CR:
 	    sess->parse_state = ST_NORMAL;
-	    if (*cdata == 0 || *cdata == '\n')
+	    if (*cdata == 0 || *cdata == '\n') {		
 		pj_mutex_unlock(sess->smutex);
 		is_valid = handle_return(sess);
 		if (!is_valid)
 		    return PJ_FALSE;
 		pj_mutex_lock(sess->smutex);
-		break;
+	    }
+	    break;
 	case ST_NORMAL:
 	    if (*cdata == IAC) {
 		sess->parse_state = ST_IAC;
@@ -1777,7 +1785,7 @@ static pj_status_t telnet_start(cli_telnet_fe *fe)
 				&val, sizeof(val));
 
     if (status != PJ_SUCCESS) {
-	PJ_LOG(3, (THIS_FILE, "Failed setting socket options"));
+	PJ_PERROR(3, (THIS_FILE, status, "Failed setting socket options"));
     }
 
     /* The loop is silly, but what else can we do? */
@@ -1812,7 +1820,7 @@ static pj_status_t telnet_start(cli_telnet_fe *fe)
 	    pj_strcat(&fe->cfg.prompt_str, &prompt_sign);
 	}
     } else {
-        PJ_LOG(3, (THIS_FILE, "Failed binding the socket"));
+        PJ_PERROR(3, (THIS_FILE, status, "Failed binding the socket"));
         goto on_exit;
     }
 
@@ -1924,7 +1932,8 @@ PJ_DEF(pj_status_t) pj_cli_telnet_get_info(pj_cli_front_end *fe,
     if (status != PJ_SUCCESS)
 	return status;
 
-    pj_strcpy2(&info->ip_address, pj_inet_ntoa(hostip.ipv4.sin_addr));
+    pj_sockaddr_print(&hostip, info->buf_, sizeof(info->buf_), 0);
+    pj_strset2(&info->ip_address, info->buf_);
 
     info->port = tfe->cfg.port;
 

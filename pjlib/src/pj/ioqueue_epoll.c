@@ -37,109 +37,21 @@
 #include <pj/compat/socket.h>
 #include <pj/rand.h>
 
-#if !defined(PJ_LINUX_KERNEL) || PJ_LINUX_KERNEL==0
-    /*
-     * Linux user mode
-     */
-#   include <sys/epoll.h>
-#   include <errno.h>
-#   include <unistd.h>
+#include <sys/epoll.h>
+#include <errno.h>
+#include <unistd.h>
 
-#   define epoll_data		data.ptr
-#   define epoll_data_type	void*
-#   define ioctl_val_type	unsigned long
-#   define getsockopt_val_ptr	int*
-#   define os_getsockopt	getsockopt
-#   define os_ioctl		ioctl
-#   define os_read		read
-#   define os_close		close
-#   define os_epoll_create	epoll_create
-#   define os_epoll_ctl		epoll_ctl
-#   define os_epoll_wait	epoll_wait
-#else
-    /*
-     * Linux kernel mode.
-     */
-#   include <linux/config.h>
-#   include <linux/version.h>
-#   if defined(MODVERSIONS)
-#	include <linux/modversions.h>
-#   endif
-#   include <linux/kernel.h>
-#   include <linux/poll.h>
-#   include <linux/eventpoll.h>
-#   include <linux/syscalls.h>
-#   include <linux/errno.h>
-#   include <linux/unistd.h>
-#   include <asm/ioctls.h>
-    enum EPOLL_EVENTS
-    {
-	EPOLLIN = 0x001,
-	EPOLLOUT = 0x004,
-	EPOLLERR = 0x008,
-    };
-#   define os_epoll_create		sys_epoll_create
-    static int os_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
-    {
-	long rc;
-	mm_segment_t oldfs = get_fs();
-	set_fs(KERNEL_DS);
-	rc = sys_epoll_ctl(epfd, op, fd, event);
-	set_fs(oldfs);
-	if (rc) {
-	    errno = -rc;
-	    return -1;
-	} else {
-	    return 0;
-	}
-    }
-    static int os_epoll_wait(int epfd, struct epoll_event *events,
-			  int maxevents, int timeout)
-    {
-	int count;
-	mm_segment_t oldfs = get_fs();
-	set_fs(KERNEL_DS);
-	count = sys_epoll_wait(epfd, events, maxevents, timeout);
-	set_fs(oldfs);
-	return count;
-    }
-#   define os_close		sys_close
-#   define os_getsockopt	pj_sock_getsockopt
-    static int os_read(int fd, void *buf, size_t len)
-    {
-	long rc;
-	mm_segment_t oldfs = get_fs();
-	set_fs(KERNEL_DS);
-	rc = sys_read(fd, buf, len);
-	set_fs(oldfs);
-	if (rc) {
-	    errno = -rc;
-	    return -1;
-	} else {
-	    return 0;
-	}
-    }
-#   define socklen_t		unsigned
-#   define ioctl_val_type	unsigned long
-    int ioctl(int fd, int opt, ioctl_val_type value);
-    static int os_ioctl(int fd, int opt, ioctl_val_type value)
-    {
-	int rc;
-        mm_segment_t oldfs = get_fs();
-	set_fs(KERNEL_DS);
-	rc = ioctl(fd, opt, value);
-	set_fs(oldfs);
-	if (rc < 0) {
-	    errno = -rc;
-	    return rc;
-	} else
-	    return rc;
-    }
-#   define getsockopt_val_ptr	char*
-
-#   define epoll_data		data
-#   define epoll_data_type	__u32
-#endif
+#define epoll_data		data.ptr
+#define epoll_data_type		void*
+#define ioctl_val_type		unsigned long
+#define getsockopt_val_ptr	int*
+#define os_getsockopt		getsockopt
+#define os_ioctl		ioctl
+#define os_read			read
+#define os_close		close
+#define os_epoll_create		epoll_create
+#define os_epoll_ctl		epoll_ctl
+#define os_epoll_wait		epoll_wait
 
 #define THIS_FILE   "ioq_epoll"
 
@@ -201,11 +113,7 @@ static void scan_closing_keys(pj_ioqueue_t *ioqueue);
  */
 PJ_DEF(const char*) pj_ioqueue_name(void)
 {
-#if defined(PJ_LINUX_KERNEL) && PJ_LINUX_KERNEL!=0
-	return "epoll-kernel";
-#else
-	return "epoll";
-#endif
+    return "epoll";
 }
 
 /*
@@ -516,11 +424,26 @@ PJ_DEF(pj_status_t) pj_ioqueue_unregister( pj_ioqueue_key_t *key)
      */
     pj_ioqueue_lock_key(key);
 
+    /* Best effort to avoid double key-unregistration */
+    if (IS_CLOSING(key)) {
+	pj_ioqueue_unlock_key(key);
+	return PJ_SUCCESS;
+    }
+
     /* Also lock ioqueue */
     pj_lock_acquire(ioqueue->lock);
 
-    pj_assert(ioqueue->count > 0);
-    --ioqueue->count;
+    /* Avoid "negative" ioqueue count */
+    if (ioqueue->count > 0) {
+	--ioqueue->count;
+    } else {
+	/* If this happens, very likely there is double unregistration
+	 * of a key.
+	 */
+	pj_assert(!"Bad ioqueue count in key unregistration!");
+	PJ_LOG(1,(THIS_FILE, "Bad ioqueue count in key unregistration!"));
+    }
+
 #if !PJ_IOQUEUE_HAS_SAFE_UNREG
     pj_list_erase(key);
 #endif
@@ -531,6 +454,7 @@ PJ_DEF(pj_status_t) pj_ioqueue_unregister( pj_ioqueue_key_t *key)
     if (status != 0) {
 	pj_status_t rc = pj_get_os_error();
 	pj_lock_release(ioqueue->lock);
+	pj_ioqueue_unlock_key(key);
 	return rc;
     }
 
@@ -651,12 +575,13 @@ static void scan_closing_keys(pj_ioqueue_t *ioqueue)
  */
 PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
 {
-    int i, count, processed;
+    int i, count, event_cnt, processed_cnt;
     int msec;
     //struct epoll_event *events = ioqueue->events;
     //struct queue *queue = ioqueue->queue;
-    struct epoll_event events[PJ_IOQUEUE_MAX_EVENTS_IN_SINGLE_POLL];
-    struct queue queue[PJ_IOQUEUE_MAX_EVENTS_IN_SINGLE_POLL];
+    enum { MAX_EVENTS = PJ_IOQUEUE_MAX_CAND_EVENTS };
+    struct epoll_event events[MAX_EVENTS];
+    struct queue queue[MAX_EVENTS];
     pj_timestamp t1, t2;
     
     PJ_CHECK_STACK();
@@ -667,7 +592,7 @@ PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
     pj_get_timestamp(&t1);
  
     //count = os_epoll_wait( ioqueue->epfd, events, ioqueue->max, msec);
-    count = os_epoll_wait( ioqueue->epfd, events, PJ_IOQUEUE_MAX_EVENTS_IN_SINGLE_POLL, msec);
+    count = os_epoll_wait( ioqueue->epfd, events, MAX_EVENTS, msec);
     if (count == 0) {
 #if PJ_IOQUEUE_HAS_SAFE_UNREG
     /* Check the closing keys only when there's no activity and when there are
@@ -694,7 +619,7 @@ PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
     /* Lock ioqueue. */
     pj_lock_acquire(ioqueue->lock);
 
-    for (processed=0, i=0; i<count; ++i) {
+    for (event_cnt=0, i=0; i<count; ++i) {
 	pj_ioqueue_key_t *h = (pj_ioqueue_key_t*)(epoll_data_type)
 				events[i].epoll_data;
 
@@ -709,9 +634,9 @@ PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
 #if PJ_IOQUEUE_HAS_SAFE_UNREG
 	    increment_counter(h);
 #endif
-	    queue[processed].key = h;
-	    queue[processed].event_type = READABLE_EVENT;
-	    ++processed;
+	    queue[event_cnt].key = h;
+	    queue[event_cnt].event_type = READABLE_EVENT;
+	    ++event_cnt;
 	    continue;
 	}
 
@@ -723,9 +648,9 @@ PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
 #if PJ_IOQUEUE_HAS_SAFE_UNREG
 	    increment_counter(h);
 #endif
-	    queue[processed].key = h;
-	    queue[processed].event_type = WRITEABLE_EVENT;
-	    ++processed;
+	    queue[event_cnt].key = h;
+	    queue[event_cnt].event_type = WRITEABLE_EVENT;
+	    ++event_cnt;
 	    continue;
 	}
 
@@ -738,9 +663,9 @@ PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
 #if PJ_IOQUEUE_HAS_SAFE_UNREG
 	    increment_counter(h);
 #endif
-	    queue[processed].key = h;
-	    queue[processed].event_type = WRITEABLE_EVENT;
-	    ++processed;
+	    queue[event_cnt].key = h;
+	    queue[event_cnt].event_type = WRITEABLE_EVENT;
+	    ++event_cnt;
 	    continue;
 	}
 #endif /* PJ_HAS_TCP */
@@ -758,21 +683,21 @@ PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
 #if PJ_IOQUEUE_HAS_SAFE_UNREG
 		increment_counter(h);
 #endif
-		queue[processed].key = h;
-		queue[processed].event_type = EXCEPTION_EVENT;
-		++processed;
+		queue[event_cnt].key = h;
+		queue[event_cnt].event_type = EXCEPTION_EVENT;
+		++event_cnt;
 	    } else if (key_has_pending_read(h) || key_has_pending_accept(h)) {
 #if PJ_IOQUEUE_HAS_SAFE_UNREG
 		increment_counter(h);
 #endif
-		queue[processed].key = h;
-		queue[processed].event_type = READABLE_EVENT;
-		++processed;
+		queue[event_cnt].key = h;
+		queue[event_cnt].event_type = READABLE_EVENT;
+		++event_cnt;
 	    }
 	    continue;
 	}
     }
-    for (i=0; i<processed; ++i) {
+    for (i=0; i<event_cnt; ++i) {
 	if (queue[i].key->grp_lock)
 	    pj_grp_lock_add_ref_dbg(queue[i].key->grp_lock, "ioqueue", 0);
     }
@@ -783,22 +708,31 @@ PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
 
     PJ_RACE_ME(5);
 
+    processed_cnt = 0;
+
     /* Now process the events. */
-    for (i=0; i<processed; ++i) {
-	switch (queue[i].event_type) {
-        case READABLE_EVENT:
-            ioqueue_dispatch_read_event(ioqueue, queue[i].key);
-            break;
-        case WRITEABLE_EVENT:
-            ioqueue_dispatch_write_event(ioqueue, queue[i].key);
-            break;
-        case EXCEPTION_EVENT:
-            ioqueue_dispatch_exception_event(ioqueue, queue[i].key);
-            break;
-        case NO_EVENT:
-            pj_assert(!"Invalid event!");
-            break;
-        }
+    for (i=0; i<event_cnt; ++i) {
+
+	/* Just do not exceed PJ_IOQUEUE_MAX_EVENTS_IN_SINGLE_POLL */
+	if (processed_cnt < PJ_IOQUEUE_MAX_EVENTS_IN_SINGLE_POLL) {
+	    switch (queue[i].event_type) {
+	    case READABLE_EVENT:
+		if (ioqueue_dispatch_read_event(ioqueue, queue[i].key))
+		    ++processed_cnt;
+		break;
+	    case WRITEABLE_EVENT:
+		if (ioqueue_dispatch_write_event(ioqueue, queue[i].key))
+		    ++processed_cnt;
+		break;
+	    case EXCEPTION_EVENT:
+		if (ioqueue_dispatch_exception_event(ioqueue, queue[i].key))
+		    ++processed_cnt;
+		break;
+	    case NO_EVENT:
+		pj_assert(!"Invalid event!");
+		break;
+	    }
+	}
 
 #if PJ_IOQUEUE_HAS_SAFE_UNREG
 	decrement_counter(queue[i].key);
@@ -812,14 +746,17 @@ PJ_DEF(int) pj_ioqueue_poll( pj_ioqueue_t *ioqueue, const pj_time_val *timeout)
     /* Special case:
      * When epoll returns > 0 but no descriptors are actually set!
      */
-    if (count > 0 && !processed && msec > 0) {
+    if (count > 0 && !event_cnt && msec > 0) {
 	pj_thread_sleep(msec);
     }
 
+    TRACE_((THIS_FILE, "     poll: count=%d events=%d processed=%d",
+		       count, event_cnt, processed_cnt));
+
     pj_get_timestamp(&t1);
     TRACE_((THIS_FILE, "ioqueue_poll() returns %d, time=%d usec",
-		       processed, pj_elapsed_usec(&t2, &t1)));
+		       processed_cnt, pj_elapsed_usec(&t2, &t1)));
 
-    return processed;
+    return processed_cnt;
 }
 

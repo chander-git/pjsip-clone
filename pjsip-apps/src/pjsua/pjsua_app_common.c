@@ -48,13 +48,13 @@ int my_atoi(const char *cs)
 
     pj_cstr(&s, cs);
     if (cs[0] == '-') {
-	s.ptr++, s.slen--;
+	s.ptr++; s.slen--;
 	return 0 - (int)pj_strtoul(&s);
     } else if (cs[0] == '+') {
-	s.ptr++, s.slen--;
-	return pj_strtoul(&s);
+	s.ptr++; s.slen--;
+	return (int)pj_strtoul(&s);
     } else {
-	return pj_strtoul(&s);
+	return (int)pj_strtoul(&s);
     }
 }
 
@@ -62,7 +62,7 @@ int my_atoi(const char *cs)
  * Find next call when current call is disconnected or when user
  * press ']'
  */
-pj_bool_t find_next_call()
+pj_bool_t find_next_call(void)
 {
     int i, max;
 
@@ -85,7 +85,7 @@ pj_bool_t find_next_call()
     return PJ_FALSE;
 }
 
-pj_bool_t find_prev_call()
+pj_bool_t find_prev_call(void)
 {
     int i, max;
 
@@ -270,9 +270,10 @@ void arrange_window(pjsua_vid_win_id wid)
 void vid_print_dev(int id, const pjmedia_vid_dev_info *vdi, const char *title)
 {
     char capnames[120];
-    char formats[120];
+    char formats[200];
     const char *dirname;
     unsigned i;
+    int st_len;
 
     if (vdi->dir == PJMEDIA_DIR_CAPTURE_RENDER) {
 	dirname = "capture, render";
@@ -284,36 +285,50 @@ void vid_print_dev(int id, const pjmedia_vid_dev_info *vdi, const char *title)
 
 
     capnames[0] = '\0';
+    st_len = 0;
     for (i=0; i<sizeof(int)*8 && (1 << i) < PJMEDIA_VID_DEV_CAP_MAX; ++i) {
 	if (vdi->caps & (1 << i)) {
 	    const char *capname = pjmedia_vid_dev_cap_name(1 << i, NULL);
 	    if (capname) {
+		int tmp_len = (int)strlen(capname);
+		if ((int)sizeof(capnames) - st_len <= tmp_len)
+		    break;
+
+		st_len += (tmp_len + 2);
 		if (*capnames)
 		    strcat(capnames, ", ");
-		strncat(capnames, capname,
-		        sizeof(capnames)-strlen(capnames)-1);
+		strcat(capnames, capname);
 	    }
 	}
     }
 
     formats[0] = '\0';
+    st_len = 0;
     for (i=0; i<vdi->fmt_cnt; ++i) {
 	const pjmedia_video_format_info *vfi =
 		pjmedia_get_video_format_info(NULL, vdi->fmt[i].id);
 	if (vfi) {
+	    int tmp_len = (int)strlen(vfi->name);
+	    if ((int)sizeof(formats) - st_len <= tmp_len) {
+		st_len = -1;
+		break;
+	    }
+
+	    st_len += (tmp_len + 2);
 	    if (*formats)
 		strcat(formats, ", ");
-	    strncat(formats, vfi->name, sizeof(formats)-strlen(formats)-1);
+	    strcat(formats, vfi->name);
 	}
     }
 
     PJ_LOG(3,(THIS_FILE, "%3d %s [%s][%s] %s", id, vdi->name, vdi->driver,
 	      dirname, title));
     PJ_LOG(3,(THIS_FILE, "    Supported capabilities: %s", capnames));
-    PJ_LOG(3,(THIS_FILE, "    Supported formats: %s", formats));
+    PJ_LOG(3,(THIS_FILE, "    Supported formats: %s%s", formats,
+			      (st_len<0? " ..." : "")));
 }
 
-void vid_list_devs()
+void vid_list_devs(void)
 {
     unsigned i, count;
     pjmedia_vid_dev_info vdi;

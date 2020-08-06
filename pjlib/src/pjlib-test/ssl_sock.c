@@ -22,11 +22,17 @@
 
 
 #define CERT_DIR		    "../build/"
-#define CERT_CA_FILE		    CERT_DIR "cacert.pem"
+#if (PJ_SSL_SOCK_IMP == PJ_SSL_SOCK_IMP_DARWIN)
+/* If we use Darwin SSL, use the cert in DER format. */
+#   define CERT_CA_FILE		    CERT_DIR "cacert.der"
+#else
+#   define CERT_CA_FILE		    CERT_DIR "cacert.pem"
+#endif
 #define CERT_FILE		    CERT_DIR "cacert.pem"
 #define CERT_PRIVKEY_FILE	    CERT_DIR "privkey.pem"
 #define CERT_PRIVKEY_PASS	    ""
 
+#define TEST_LOAD_FROM_FILES 1
 
 #if INCLUDE_SSLSOCK_TEST
 
@@ -40,7 +46,7 @@ struct send_key {
 
 static int get_cipher_list(void) {
     pj_status_t status;
-    pj_ssl_cipher ciphers[100];
+    pj_ssl_cipher ciphers[PJ_SSL_SOCK_MAX_CIPHERS];
     unsigned cipher_num;
     unsigned i;
 
@@ -398,9 +404,9 @@ static pj_bool_t ssl_on_data_sent(pj_ssl_sock_t *ssock,
     return PJ_TRUE;
 }
 
-#define HTTP_REQ		"GET / HTTP/1.0\r\n\r\n";
 #define HTTP_SERVER_ADDR	"trac.pjsip.org"
 #define HTTP_SERVER_PORT	443
+#define HTTP_REQ		"GET https://" HTTP_SERVER_ADDR "/ HTTP/1.0\r\n\r\n";
 
 static int https_client_test(unsigned ms_timeout)
 {
@@ -492,6 +498,27 @@ on_return:
     return status;
 }
 
+#if !(defined(TEST_LOAD_FROM_FILES) && TEST_LOAD_FROM_FILES==1) 
+static pj_status_t load_cert_to_buf(pj_pool_t *pool, const pj_str_t *file_name,
+				    pj_ssl_cert_buffer *buf)
+{
+    pj_status_t status;
+    pj_oshandle_t fd = 0;
+    pj_ssize_t size = (pj_ssize_t)pj_file_size(file_name->ptr);
+
+    status = pj_file_open(pool, file_name->ptr, PJ_O_RDONLY, &fd);
+    if (status != PJ_SUCCESS)
+	return status;
+
+    buf->ptr = (char*)pj_pool_zalloc(pool, size+1);
+    status = pj_file_read(fd, buf->ptr, &size);
+    buf->slen = size;
+
+    pj_file_close(fd);
+    fd = NULL;
+    return status;
+}
+#endif
 
 static int echo_test(pj_ssl_sock_proto srv_proto, pj_ssl_sock_proto cli_proto,
 		     pj_ssl_cipher srv_cipher, pj_ssl_cipher cli_cipher,
@@ -549,14 +576,37 @@ static int echo_test(pj_ssl_sock_proto srv_proto, pj_ssl_sock_proto cli_proto,
 
     /* Set server cert */
     {
-	pj_str_t tmp1, tmp2, tmp3, tmp4;
+	pj_str_t ca_file = pj_str(CERT_CA_FILE);
+	pj_str_t cert_file = pj_str(CERT_FILE);
+	pj_str_t privkey_file = pj_str(CERT_PRIVKEY_FILE);
+	pj_str_t privkey_pass = pj_str(CERT_PRIVKEY_PASS);
 
-	status = pj_ssl_cert_load_from_files(pool, 
-					     pj_strset2(&tmp1, (char*)CERT_CA_FILE), 
-					     pj_strset2(&tmp2, (char*)CERT_FILE), 
-					     pj_strset2(&tmp3, (char*)CERT_PRIVKEY_FILE), 
-					     pj_strset2(&tmp4, (char*)CERT_PRIVKEY_PASS), 
+#if (defined(TEST_LOAD_FROM_FILES) && TEST_LOAD_FROM_FILES==1)
+	status = pj_ssl_cert_load_from_files(pool, &ca_file, &cert_file, 
+					     &privkey_file, &privkey_pass,
 					     &cert);
+#else
+	pj_ssl_cert_buffer ca_buf, cert_buf, privkey_buf;
+
+	status = load_cert_to_buf(pool, &ca_file, &ca_buf);
+	if (status != PJ_SUCCESS) {
+	    goto on_return;
+	}
+
+	status = load_cert_to_buf(pool, &cert_file, &cert_buf);
+	if (status != PJ_SUCCESS) {
+	    goto on_return;
+	}
+
+	status = load_cert_to_buf(pool, &privkey_file, &privkey_buf);
+	if (status != PJ_SUCCESS) {
+	    goto on_return;
+	}
+
+	status = pj_ssl_cert_load_from_buffer(pool, &ca_buf, &cert_buf,
+					      &privkey_buf, &privkey_pass, 
+					      &cert);
+#endif
 	if (status != PJ_SUCCESS) {
 	    goto on_return;
 	}
@@ -613,16 +663,29 @@ static int echo_test(pj_ssl_sock_proto srv_proto, pj_ssl_sock_proto cli_proto,
     {
 
 	if (!client_provide_cert) {
-	    pj_str_t tmp1, tmp2;
+	    pj_str_t ca_file = pj_str(CERT_CA_FILE);
+	    pj_str_t null_str = pj_str("");
 
-	    pj_strset2(&tmp1, (char*)CERT_CA_FILE);
-	    pj_strset2(&tmp2, NULL);
-	    status = pj_ssl_cert_load_from_files(pool, 
-						 &tmp1, &tmp2, &tmp2, &tmp2,
-						 &cert);
+#if (defined(TEST_LOAD_FROM_FILES) && TEST_LOAD_FROM_FILES==1)
+	    status = pj_ssl_cert_load_from_files(pool, &ca_file, &null_str, 
+						 &null_str, &null_str, &cert);
+#else
+	    pj_ssl_cert_buffer null_buf, ca_buf;
+
+	    null_buf.slen = 0;
+
+	    status = load_cert_to_buf(pool, &ca_file, &ca_buf);
 	    if (status != PJ_SUCCESS) {
 		goto on_return;
 	    }
+
+	    status = pj_ssl_cert_load_from_buffer(pool, &ca_buf, &null_buf,
+						  &null_buf, &null_str, &cert);
+#endif
+	    if (status != PJ_SUCCESS) {
+		goto on_return;
+	    }
+
 	}
 
 	status = pj_ssl_sock_set_certificate(ssock_cli, pool, cert);
@@ -824,13 +887,45 @@ static int client_non_ssl(unsigned ms_timeout)
 
     /* Set cert */
     {
-	pj_str_t tmp1, tmp2, tmp3, tmp4;
-	status = pj_ssl_cert_load_from_files(pool, 
-					     pj_strset2(&tmp1, (char*)CERT_CA_FILE), 
-					     pj_strset2(&tmp2, (char*)CERT_FILE), 
-					     pj_strset2(&tmp3, (char*)CERT_PRIVKEY_FILE), 
-					     pj_strset2(&tmp4, (char*)CERT_PRIVKEY_PASS), 
+	pj_str_t ca_file = pj_str(CERT_CA_FILE);
+	pj_str_t cert_file = pj_str(CERT_FILE);
+	pj_str_t privkey_file = pj_str(CERT_PRIVKEY_FILE);
+	pj_str_t privkey_pass = pj_str(CERT_PRIVKEY_PASS);
+
+#if (PJ_SSL_SOCK_IMP == PJ_SSL_SOCK_IMP_DARWIN)
+	PJ_LOG(3, ("", "Darwin SSL requires the private key to be "
+		       "inside the Keychain. So double click on "
+		       "the file pjlib/build/privkey.p12 to "
+		       "place it in the Keychain. "
+		       "The password is \"pjsip\"."));
+#endif
+
+#if (defined(TEST_LOAD_FROM_FILES) && TEST_LOAD_FROM_FILES==1)
+	status = pj_ssl_cert_load_from_files(pool, &ca_file, &cert_file, 
+					     &privkey_file, &privkey_pass,
 					     &cert);
+#else
+	pj_ssl_cert_buffer ca_buf, cert_buf, privkey_buf;
+
+	status = load_cert_to_buf(pool, &ca_file, &ca_buf);
+	if (status != PJ_SUCCESS) {
+	    goto on_return;
+	}
+
+	status = load_cert_to_buf(pool, &cert_file, &cert_buf);
+	if (status != PJ_SUCCESS) {
+	    goto on_return;
+	}
+
+	status = load_cert_to_buf(pool, &privkey_file, &privkey_buf);
+	if (status != PJ_SUCCESS) {
+	    goto on_return;
+	}
+
+	status = pj_ssl_cert_load_from_buffer(pool, &ca_buf, &cert_buf,
+					      &privkey_buf, &privkey_pass, 
+					      &cert);
+#endif
 	if (status != PJ_SUCCESS) {
 	    goto on_return;
 	}
@@ -1131,14 +1226,37 @@ static int perf_test(unsigned clients, unsigned ms_handshake_timeout)
 
     /* Set cert */
     {
-	pj_str_t tmp1, tmp2, tmp3, tmp4;
+	pj_str_t ca_file = pj_str(CERT_CA_FILE);
+	pj_str_t cert_file = pj_str(CERT_FILE);
+	pj_str_t privkey_file = pj_str(CERT_PRIVKEY_FILE);
+	pj_str_t privkey_pass = pj_str(CERT_PRIVKEY_PASS);
 
-	status = pj_ssl_cert_load_from_files(pool, 
-					     pj_strset2(&tmp1, (char*)CERT_CA_FILE), 
-					     pj_strset2(&tmp2, (char*)CERT_FILE), 
-					     pj_strset2(&tmp3, (char*)CERT_PRIVKEY_FILE), 
-					     pj_strset2(&tmp4, (char*)CERT_PRIVKEY_PASS), 
+#if (defined(TEST_LOAD_FROM_FILES) && TEST_LOAD_FROM_FILES==1)
+	status = pj_ssl_cert_load_from_files(pool, &ca_file, &cert_file, 
+					     &privkey_file, &privkey_pass,
 					     &cert);
+#else
+	pj_ssl_cert_buffer ca_buf, cert_buf, privkey_buf;
+
+	status = load_cert_to_buf(pool, &ca_file, &ca_buf);
+	if (status != PJ_SUCCESS) {
+	    goto on_return;
+	}
+
+	status = load_cert_to_buf(pool, &cert_file, &cert_buf);
+	if (status != PJ_SUCCESS) {
+	    goto on_return;
+	}
+
+	status = load_cert_to_buf(pool, &privkey_file, &privkey_buf);
+	if (status != PJ_SUCCESS) {
+	    goto on_return;
+	}
+
+	status = pj_ssl_cert_load_from_buffer(pool, &ca_buf, &cert_buf,
+					      &privkey_buf, &privkey_pass, 
+					      &cert);
+#endif
 	if (status != PJ_SUCCESS) {
 	    goto on_return;
 	}
@@ -1318,9 +1436,11 @@ on_return:
     if (ssock_serv) 
 	pj_ssl_sock_close(ssock_serv);
 
-    for (i = 0; i < clients; ++i) {
-	if (ssock_cli[i] && !state_cli[i].err && !state_cli[i].done)
-	    pj_ssl_sock_close(ssock_cli[i]);
+    if (ssock_cli && state_cli) {
+        for (i = 0; i < clients; ++i) {
+	    if (ssock_cli[i] && !state_cli[i].err && !state_cli[i].done)
+	        pj_ssl_sock_close(ssock_cli[i]);
+	}
     }
     if (ioqueue)
 	pj_ioqueue_destroy(ioqueue);
@@ -1376,9 +1496,9 @@ int ssl_sock_test(void)
      * which require SSL server, for now.
      */
 
-    PJ_LOG(3,("", "..echo test w/ TLSv1 and PJ_TLS_RSA_WITH_DES_CBC_SHA cipher"));
+    PJ_LOG(3,("", "..echo test w/ TLSv1 and PJ_TLS_RSA_WITH_AES_256_CBC_SHA cipher"));
     ret = echo_test(PJ_SSL_SOCK_PROTO_TLS1, PJ_SSL_SOCK_PROTO_TLS1, 
-		    PJ_TLS_RSA_WITH_DES_CBC_SHA, PJ_TLS_RSA_WITH_DES_CBC_SHA, 
+		    PJ_TLS_RSA_WITH_AES_256_CBC_SHA, PJ_TLS_RSA_WITH_AES_256_CBC_SHA, 
 		    PJ_FALSE, PJ_FALSE);
     if (ret != 0)
 	return ret;
@@ -1390,9 +1510,30 @@ int ssl_sock_test(void)
     if (ret != 0)
 	return ret;
 
-    PJ_LOG(3,("", "..echo test w/ incompatible proto"));
+    PJ_LOG(3,("", "..echo test w/ compatible proto: server TLSv1.2 vs client TLSv1.2"));
+    ret = echo_test(PJ_SSL_SOCK_PROTO_TLS1_2, PJ_SSL_SOCK_PROTO_TLS1_2, 
+		    -1, -1,
+		    PJ_FALSE, PJ_FALSE);
+    if (ret != 0)
+	return ret;
+
+    PJ_LOG(3,("", "..echo test w/ compatible proto: server TLSv1.2+1.3 vs client TLSv1.3"));
+    ret = echo_test(PJ_SSL_SOCK_PROTO_TLS1_2 | PJ_SSL_SOCK_PROTO_TLS1_3, PJ_SSL_SOCK_PROTO_TLS1_3, 
+		    -1, -1,
+		    PJ_FALSE, PJ_FALSE);
+    if (ret != 0)
+	return ret;
+
+    PJ_LOG(3,("", "..echo test w/ incompatible proto: server TLSv1 vs client SSL3"));
     ret = echo_test(PJ_SSL_SOCK_PROTO_TLS1, PJ_SSL_SOCK_PROTO_SSL3, 
 		    PJ_TLS_RSA_WITH_DES_CBC_SHA, PJ_TLS_RSA_WITH_DES_CBC_SHA,
+		    PJ_FALSE, PJ_FALSE);
+    if (ret == 0)
+	return PJ_EBUG;
+
+    PJ_LOG(3,("", "..echo test w/ incompatible proto: server TLSv1.2 vs client TLSv1.3"));
+    ret = echo_test(PJ_SSL_SOCK_PROTO_TLS1_2, PJ_SSL_SOCK_PROTO_TLS1_3, 
+		    -1, -1,
 		    PJ_FALSE, PJ_FALSE);
     if (ret == 0)
 	return PJ_EBUG;
@@ -1418,10 +1559,12 @@ int ssl_sock_test(void)
     if (ret != 0)
 	return ret;
 
+#if WITH_BENCHMARK
     PJ_LOG(3,("", "..performance test"));
     ret = perf_test(PJ_IOQUEUE_MAX_HANDLES/2 - 1, 0);
     if (ret != 0)
 	return ret;
+#endif
 
     PJ_LOG(3,("", "..client non-SSL (handshake timeout 5 secs)"));
     ret = client_non_ssl(5000);

@@ -24,7 +24,14 @@ public:
     virtual ~PjsuaAppCallback() {}
     virtual void onStarted(const char *msg) {}
     virtual void onStopped(int restart) {}
+    virtual void onCallVideoStart() {}
 };
+
+typedef struct WindowHandle {
+    void    	*window;
+} WindowHandle;
+
+void setVideoWindow(const WindowHandle& win);
 
 extern "C" {
 int pjsuaStart();

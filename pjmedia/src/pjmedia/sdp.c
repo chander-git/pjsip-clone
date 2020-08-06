@@ -144,6 +144,8 @@ PJ_DEF(pjmedia_sdp_attr*) pjmedia_sdp_attr_find (unsigned count,
     unsigned i;
     unsigned c_pt = 0xFFFF;
 
+    PJ_ASSERT_RETURN(count <= PJMEDIA_MAX_SDP_ATTR, NULL);
+
     if (c_fmt)
 	c_pt = pj_strtoul(c_fmt);
 
@@ -199,6 +201,7 @@ PJ_DEF(unsigned) pjmedia_sdp_attr_remove_all(unsigned *count,
     pj_str_t attr_name;
 
     PJ_ASSERT_RETURN(count && attr_array && name, PJ_EINVAL);
+    PJ_ASSERT_RETURN(*count <= PJMEDIA_MAX_SDP_ATTR, PJ_ETOOMANY);
 
     attr_name.ptr = (char*)name;
     attr_name.slen = pj_ansi_strlen(name);
@@ -225,6 +228,7 @@ PJ_DEF(pj_status_t) pjmedia_sdp_attr_remove( unsigned *count,
     unsigned i, removed=0;
 
     PJ_ASSERT_RETURN(count && attr_array && attr, PJ_EINVAL);
+    PJ_ASSERT_RETURN(*count <= PJMEDIA_MAX_SDP_ATTR, PJ_ETOOMANY);
 
     for (i=0; i<*count; ) {
 	if (attr_array[i] == attr) {
@@ -252,7 +256,8 @@ PJ_DEF(pj_status_t) pjmedia_sdp_attr_get_rtpmap( const pjmedia_sdp_attr *attr,
 
     PJ_ASSERT_RETURN(pj_strcmp2(&attr->name, "rtpmap")==0, PJ_EINVALIDOP);
 
-    PJ_ASSERT_RETURN(attr->value.slen != 0, PJMEDIA_SDP_EINATTR);
+    if (attr->value.slen == 0)
+        return PJMEDIA_SDP_EINATTR;
 
     init_sdp_parser();
 
@@ -271,6 +276,9 @@ PJ_DEF(pj_status_t) pjmedia_sdp_attr_get_rtpmap( const pjmedia_sdp_attr *attr,
 	attr->value.ptr[attr->value.slen] = '\0';
     }
 
+    /* The buffer passed to the scanner is not guaranteed to be NULL
+     * terminated, but should be safe. See ticket #2063.
+     */    
     pj_scan_init(&scanner, (char*)attr->value.ptr, attr->value.slen,
 		 PJ_SCAN_AUTOSKIP_WS, &on_scanner_error);
 
@@ -337,6 +345,9 @@ PJ_DEF(pj_status_t) pjmedia_sdp_attr_get_fmtp( const pjmedia_sdp_attr *attr,
 
     PJ_ASSERT_RETURN(pj_strcmp2(&attr->name, "fmtp")==0, PJ_EINVALIDOP);
 
+    if (attr->value.slen == 0)
+        return PJMEDIA_SDP_EINATTR;
+
     /* fmtp BNF:
      *	a=fmtp:<format> <format specific parameter>
      */
@@ -375,12 +386,18 @@ PJ_DEF(pj_status_t) pjmedia_sdp_attr_get_rtcp(const pjmedia_sdp_attr *attr,
 
     PJ_ASSERT_RETURN(pj_strcmp2(&attr->name, "rtcp")==0, PJ_EINVALIDOP);
 
+    if (attr->value.slen == 0)
+        return PJMEDIA_SDP_EINATTR;
+
     init_sdp_parser();
 
     /* fmtp BNF:
      *	a=rtcp:<port> [nettype addrtype address]
      */
 
+    /* The buffer passed to the scanner is not guaranteed to be NULL
+     * terminated, but should be safe. See ticket #2063.
+     */
     pj_scan_init(&scanner, (char*)attr->value.ptr, attr->value.slen,
 		 PJ_SCAN_AUTOSKIP_WS, &on_scanner_error);
 
@@ -404,7 +421,8 @@ PJ_DEF(pj_status_t) pjmedia_sdp_attr_get_rtcp(const pjmedia_sdp_attr *attr,
 	    pj_scan_get(&scanner, &cs_token, &rtcp->addr_type);
 
 	    /* Get the address */
-	    pj_scan_get(&scanner, &cs_token, &rtcp->addr);
+	    //pj_scan_get(&scanner, &cs_token, &rtcp->addr);
+	    pj_scan_get_until_chr(&scanner, "/ \t\r\n", &rtcp->addr);
 
 	}
 
@@ -427,6 +445,7 @@ PJ_DEF(pjmedia_sdp_attr*) pjmedia_sdp_attr_create_rtcp(pj_pool_t *pool,
     enum {
 	ATTR_LEN = PJ_INET6_ADDRSTRLEN+16
     };
+    char tmp_addr[PJ_INET6_ADDRSTRLEN];
     pjmedia_sdp_attr *attr;
 
     attr = PJ_POOL_ALLOC_T(pool, pjmedia_sdp_attr);
@@ -436,10 +455,10 @@ PJ_DEF(pjmedia_sdp_attr*) pjmedia_sdp_attr_create_rtcp(pj_pool_t *pool,
 	attr->value.slen = 
 	    pj_ansi_snprintf(attr->value.ptr, ATTR_LEN,
 			    "%u IN IP4 %s",
-			    pj_ntohs(a->ipv4.sin_port),
-			    pj_inet_ntoa(a->ipv4.sin_addr));
+			    pj_sockaddr_get_port(a),
+			    pj_sockaddr_print(a, tmp_addr, 
+					      sizeof(tmp_addr), 0));
     } else if (a->addr.sa_family == pj_AF_INET6()) {
-	char tmp_addr[PJ_INET6_ADDRSTRLEN];
 	attr->value.slen = 
 	    pj_ansi_snprintf(attr->value.ptr, ATTR_LEN,
 			    "%u IN IP6 %s",
@@ -451,6 +470,89 @@ PJ_DEF(pjmedia_sdp_attr*) pjmedia_sdp_attr_create_rtcp(pj_pool_t *pool,
 	pj_assert(!"Unsupported address family");
 	return NULL;
     }
+
+    return attr;
+}
+
+
+PJ_DEF(pj_status_t) pjmedia_sdp_attr_get_ssrc(const pjmedia_sdp_attr *attr,
+					      pjmedia_sdp_ssrc_attr *ssrc)
+{
+    pj_scanner scanner;
+    pj_str_t token;
+    pj_status_t status = -1;
+    PJ_USE_EXCEPTION;
+
+    PJ_ASSERT_RETURN(pj_strcmp2(&attr->name, "ssrc")==0, PJ_EINVALIDOP);
+
+    if (attr->value.slen == 0)
+        return PJMEDIA_SDP_EINATTR;
+
+    init_sdp_parser();
+
+    /* ssrc BNF:
+     *  a=ssrc:<ssrc-id> <attribute>
+     *	a=ssrc:<ssrc-id> <attribute>:<value>
+     */
+
+    /* The buffer passed to the scanner is not guaranteed to be NULL
+     * terminated, but should be safe. See ticket #2063.
+     */
+    pj_scan_init(&scanner, (char*)attr->value.ptr, attr->value.slen,
+		 PJ_SCAN_AUTOSKIP_WS, &on_scanner_error);
+
+    /* Init */
+    pj_bzero(ssrc, sizeof(*ssrc));
+
+    /* Parse */
+    PJ_TRY {
+        pj_str_t scan_attr;
+
+	/* Get the ssrc */
+	pj_scan_get(&scanner, &cs_digit, &token);
+	ssrc->ssrc = pj_strtoul(&token);
+
+    	pj_scan_get_char(&scanner);
+	pj_scan_get(&scanner, &cs_token, &scan_attr);
+	
+	/* Get cname attribute, if any */
+	if (!pj_scan_is_eof(&scanner) &&
+	    pj_scan_get_char(&scanner) == ':' &&
+	    pj_strcmp2(&scan_attr, "cname"))
+	{
+	    pj_scan_get(&scanner, &cs_token, &ssrc->cname);
+	}
+
+	status = PJ_SUCCESS;
+
+    }
+    PJ_CATCH_ANY {
+	status = PJMEDIA_SDP_EINSSRC;
+    }
+    PJ_END;
+
+    pj_scan_fini(&scanner);
+    return status;
+}
+
+
+PJ_DEF(pjmedia_sdp_attr*) pjmedia_sdp_attr_create_ssrc( pj_pool_t *pool,
+							pj_uint32_t ssrc,
+							const pj_str_t *cname)
+{
+    pjmedia_sdp_attr *attr;
+
+    if (cname->slen == 0)
+        return NULL;
+
+    attr = PJ_POOL_ALLOC_T(pool, pjmedia_sdp_attr);
+    attr->name = pj_str("ssrc");
+    attr->value.ptr = (char*) pj_pool_alloc(pool, cname->slen+7 /* " cname:"*/
+    						  + 10 /* 32-bit integer */
+    						  + 1 /* NULL */);
+    attr->value.slen = pj_ansi_snprintf(attr->value.ptr, cname->slen+18,
+    					"%d cname:%.*s", ssrc,
+			   	   	(int)cname->slen, cname->ptr);
 
     return attr;
 }
@@ -1238,9 +1340,19 @@ PJ_DEF(pj_status_t) pjmedia_sdp_parse( pj_pool_t *pool,
 		    attr = parse_attr(pool, &scanner, &ctx);
 		    if (attr) {
 			if (media) {
-			    pjmedia_sdp_media_add_attr(media, attr);
+			    if (media->attr_count < PJMEDIA_MAX_SDP_ATTR)
+				pjmedia_sdp_media_add_attr(media, attr);
+			    else
+				PJ_PERROR(2, (THIS_FILE, PJ_ETOOMANY,
+					      "Error adding media attribute, "
+					      "attribute is ignored"));
 			} else {
-			    pjmedia_sdp_session_add_attr(session, attr);
+			    if (session->attr_count < PJMEDIA_MAX_SDP_ATTR)
+				pjmedia_sdp_session_add_attr(session, attr);
+			    else
+				PJ_PERROR(2, (THIS_FILE, PJ_ETOOMANY,
+					      "Error adding session attribute"
+					      ", attribute is ignored"));
 			}
 		    }
 		    break;
@@ -1290,9 +1402,19 @@ PJ_DEF(pj_status_t) pjmedia_sdp_parse( pj_pool_t *pool,
 		    bandw = PJ_POOL_ZALLOC_T(pool, pjmedia_sdp_bandw);
 		    parse_bandwidth_info(&scanner, bandw, &ctx);
 		    if (media) {
-			media->bandw[media->bandw_count++] = bandw;
+			if (media->bandw_count < PJMEDIA_MAX_SDP_BANDW)
+			    media->bandw[media->bandw_count++] = bandw;
+			else
+			    PJ_PERROR(2, (THIS_FILE, PJ_ETOOMANY,
+					  "Error adding media bandwidth "
+					  "info, info is ignored"));
 		    } else {
-			session->bandw[session->bandw_count++] = bandw;
+			if (session->bandw_count < PJMEDIA_MAX_SDP_BANDW)
+			    session->bandw[session->bandw_count++] = bandw;
+			else
+			    PJ_PERROR(2, (THIS_FILE, PJ_ETOOMANY,
+					  "Error adding session bandwidth "
+					  "info, info is ignored"));
 		    }
 		    break;
 		default:
@@ -1311,12 +1433,9 @@ PJ_DEF(pj_status_t) pjmedia_sdp_parse( pj_pool_t *pool,
     }
     PJ_CATCH_ANY {
 	
-	char errmsg[PJ_ERR_MSG_SIZE];
-	pj_strerror(ctx.last_error, errmsg, sizeof(errmsg));
-
-	PJ_LOG(4, (THIS_FILE, "Error parsing SDP in line %d col %d: %s",
-		   scanner.line, pj_scan_get_col(&scanner),
-		   errmsg));
+	PJ_PERROR(4, (THIS_FILE, ctx.last_error,
+		      "Error parsing SDP in line %d col %d",
+		      scanner.line, pj_scan_get_col(&scanner)));
 
 	session = NULL;
 
@@ -1490,11 +1609,12 @@ PJ_DEF(pj_status_t) pjmedia_sdp_validate2(const pjmedia_sdp_session *sdp,
 	     * RTC based programs sends "null" for instant messaging!
 	     */
 	    if (pj_isdigit(*m->desc.fmt[j].ptr)) {
-		unsigned pt = pj_strtoul(&m->desc.fmt[j]);
+		unsigned long pt;
+		pj_status_t status = pj_strtoul3(&m->desc.fmt[j], &pt, 10);
 
 		/* Payload type is between 0 and 127. 
 		 */
-		CHECK( pt <= 127, PJMEDIA_SDP_EINPT);
+		CHECK( status == PJ_SUCCESS && pt <= 127, PJMEDIA_SDP_EINPT);
 
 		/* If port is not zero, then for each dynamic payload type, an
 		 * rtpmap attribute must be specified.
@@ -1518,19 +1638,85 @@ PJ_DEF(pj_status_t) pjmedia_sdp_validate2(const pjmedia_sdp_session *sdp,
 PJ_DEF(pj_status_t) pjmedia_sdp_transport_cmp( const pj_str_t *t1,
 					       const pj_str_t *t2)
 {
-    static const pj_str_t ID_RTP_AVP  = { "RTP/AVP", 7 };
-    static const pj_str_t ID_RTP_SAVP = { "RTP/SAVP", 8 };
+    pj_uint32_t t1_proto, t2_proto;
 
     /* Exactly equal? */
     if (pj_stricmp(t1, t2) == 0)
 	return PJ_SUCCESS;
 
-    /* Compatible? */
-    if ((!pj_stricmp(t1, &ID_RTP_AVP) || !pj_stricmp(t1, &ID_RTP_SAVP)) &&
-        (!pj_stricmp(t2, &ID_RTP_AVP) || !pj_stricmp(t2, &ID_RTP_SAVP)))
+    /* Check if boths are RTP/AVP based */
+    t1_proto = pjmedia_sdp_transport_get_proto(t1);
+    t2_proto = pjmedia_sdp_transport_get_proto(t2);
+    if (PJMEDIA_TP_PROTO_HAS_FLAG(t1_proto, PJMEDIA_TP_PROTO_RTP_AVP) && 
+	PJMEDIA_TP_PROTO_HAS_FLAG(t2_proto, PJMEDIA_TP_PROTO_RTP_AVP))
+    {
 	return PJ_SUCCESS;
+    }
+
+    /* Compatible? */
+    //{
+    //	static const pj_str_t ID_RTP_AVP  = { "RTP/AVP", 7 };
+    //	static const pj_str_t ID_RTP_SAVP = { "RTP/SAVP", 8 };
+    //	if ((!pj_stricmp(t1, &ID_RTP_AVP) || !pj_stricmp(t1, &ID_RTP_SAVP)) &&
+    //      (!pj_stricmp(t2, &ID_RTP_AVP) || !pj_stricmp(t2, &ID_RTP_SAVP)))
+    //	    return PJ_SUCCESS;
+    //}
 
     return PJMEDIA_SDP_ETPORTNOTEQUAL;
+}
+
+
+/*
+ * Get media transport info, e.g: protocol and profile.
+ */
+PJ_DEF(pj_uint32_t) pjmedia_sdp_transport_get_proto(const pj_str_t *tp)
+{
+    pj_str_t token, rest = {0};
+    pj_ssize_t idx;
+
+    PJ_ASSERT_RETURN(tp, PJMEDIA_TP_PROTO_NONE);
+
+    idx = pj_strtok2(tp, "/", &token, 0);
+    if (idx != tp->slen)
+	pj_strset(&rest, tp->ptr + token.slen + 1, tp->slen - token.slen - 1);
+
+    if (pj_stricmp2(&token, "RTP") == 0) {
+	/* Starts with "RTP" */
+
+	/* RTP/AVP */
+	if (pj_stricmp2(&rest, "AVP") == 0)
+	    return PJMEDIA_TP_PROTO_RTP_AVP;
+
+	/* RTP/SAVP */
+	if (pj_stricmp2(&rest, "SAVP") == 0)
+	    return PJMEDIA_TP_PROTO_RTP_SAVP;
+
+	/* RTP/AVPF */
+	if (pj_stricmp2(&rest, "AVPF") == 0)
+	    return PJMEDIA_TP_PROTO_RTP_AVPF;
+
+	/* RTP/SAVPF */
+	if (pj_stricmp2(&rest, "SAVPF") == 0)
+	    return PJMEDIA_TP_PROTO_RTP_SAVPF;
+
+    } else if (pj_stricmp2(&token, "UDP") == 0) {
+	/* Starts with "UDP" */
+
+	/* Plain UDP */
+	if (rest.slen == 0)
+	    return PJMEDIA_TP_PROTO_UDP;
+
+	/* DTLS-SRTP */
+	if (pj_stricmp2(&rest, "TLS/RTP/SAVP") == 0)
+	    return PJMEDIA_TP_PROTO_DTLS_SRTP;
+
+	/* DTLS-SRTP with RTCP-FB */
+	if (pj_stricmp2(&rest, "TLS/RTP/SAVPF") == 0)
+	    return PJMEDIA_TP_PROTO_DTLS_SRTPF;
+    }
+
+    /* Unknown transport */
+    return PJMEDIA_TP_PROTO_UNKNOWN;
 }
 
 

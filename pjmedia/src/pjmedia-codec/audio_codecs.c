@@ -34,7 +34,7 @@ pjmedia_codec_register_audio_codecs(pjmedia_endpt *endpt,
                                     const pjmedia_audio_codec_config *c)
 {
     pjmedia_audio_codec_config default_cfg;
-    pj_status_t status;
+    pj_status_t status = PJ_SUCCESS;
 
     PJ_ASSERT_RETURN(endpt, PJ_EINVAL);
     if (!c) {
@@ -117,6 +117,20 @@ pjmedia_codec_register_audio_codecs(pjmedia_endpt *endpt,
 #if PJMEDIA_HAS_SILK_CODEC
     /* Register SILK */
     status = pjmedia_codec_silk_init(endpt);
+    if (status != PJ_SUCCESS)
+	return status;
+#endif
+
+#if PJMEDIA_HAS_OPUS_CODEC
+    /* Register OPUS */
+    status = pjmedia_codec_opus_init(endpt);
+    if (status != PJ_SUCCESS)
+	return status;
+#endif
+
+#if PJMEDIA_HAS_BCG729
+    /* Register BCG729 */
+    status = pjmedia_codec_bcg729_init(endpt);
     if (status != PJ_SUCCESS)
 	return status;
 #endif
